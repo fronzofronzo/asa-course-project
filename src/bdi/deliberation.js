@@ -122,14 +122,15 @@ function filterIntentions(desires, currentIntention, epsilon) {
 }
 
 /**
- * A* on walkability graph. Returns ordered direction list or null if unreachable.
+ * A* on walkability graph. Respects directional tiles via exitDirs.
  * @param {{ x:number, y:number }} from  agent current position (may be fractional)
  * @param {{ x:number, y:number }} to    target tile
  * @param {Set<string>} walkable
+ * @param {Map<string, Set<string>>} exitDirs  per-tile allowed exit directions; absent = all
  * @param {Map<string, object>} knownAgents  belief agents (their tiles are avoided)
  * @returns {string[] | null}
  */
-function computePath(from, to, walkable, knownAgents) {
+function computePath(from, to, walkable, exitDirs, knownAgents) {
     const sx = Math.round(from.x), sy = Math.round(from.y);
     const gx = to.x, gy = to.y;
     const startKey = `${sx},${sy}`;
@@ -141,7 +142,7 @@ function computePath(from, to, walkable, knownAgents) {
     const blocked = new Set(
         [...knownAgents.values()].map(a => `${Math.round(a.x)},${Math.round(a.y)}`)
     );
-    blocked.delete(startKey); // never block start
+    blocked.delete(startKey);
 
     const h = (x, y) => Math.abs(x - gx) + Math.abs(y - gy);
     const dirs = [
@@ -164,7 +165,9 @@ function computePath(from, to, walkable, knownAgents) {
         if ((visited.get(key) ?? Infinity) <= g) continue;
         visited.set(key, g);
 
+        const allowed = exitDirs.get(key); // undefined = all directions OK
         for (const { dx, dy, dir } of dirs) {
+            if (allowed && !allowed.has(dir)) continue; // tile restricts this exit
             const nx = x + dx, ny = y + dy;
             const nkey = `${nx},${ny}`;
             if (!walkable.has(nkey) || blocked.has(nkey)) continue;
@@ -188,6 +191,7 @@ async function go_to(target, agent) {
             { x: agent.x, y: agent.y },
             target,
             agent.beliefs.map.walkable,
+            agent.beliefs.map.exitDirs,
             agent.beliefs.agents
         );
 
@@ -213,4 +217,32 @@ async function go_to(target, agent) {
     }
 }
 
-export { generateOptions, filterIntentions, bfsDist, distToNearestDelivery, computePath, go_to };
+/**
+ * Execute ONE move step toward target. Returns 'arrived' | 'moved' | 'stuck'.
+ * @param {{ x:number, y:number }} target
+ * @param {object} agent
+ * @returns {Promise<'arrived'|'moved'|'stuck'>}
+ */
+async function stepToward(target, agent) {
+    const path = computePath(
+        { x: agent.x, y: agent.y },
+        target,
+        agent.beliefs.map.walkable,
+        agent.beliefs.map.exitDirs,
+        agent.beliefs.agents
+    );
+
+    if (path === null) return 'stuck';
+    if (path.length === 0) return 'arrived';
+
+    const result = await agent.socket.emitMove(path[0]);
+    if (result === false) return 'stuck';
+
+    agent.x = result.x;
+    agent.y = result.y;
+
+    if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
+    return 'moved';
+}
+
+export { generateOptions, filterIntentions, bfsDist, distToNearestDelivery, computePath, go_to, stepToward };

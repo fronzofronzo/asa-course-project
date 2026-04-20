@@ -7,6 +7,7 @@ class BeliefSet {
             deliveryTiles: [],     // IOTile[] where type === '2'
             spawnTiles: [],        // IOTile[] where type === '1'
             walkable: new Set(),   // Set of `${x},${y}` strings
+            exitDirs: new Map(),   // key: `${x},${y}` → Set of allowed exit directions ('up'|'down'|'left'|'right'); absent = all directions allowed
         };
         this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen }
         this.agents = new Map();   // id → { id, name, x, y, score, lastSeen }
@@ -94,14 +95,22 @@ class BeliefSet {
         this.map.deliveryTiles = [];
         this.map.spawnTiles = [];
         this.map.walkable.clear();
+        this.map.exitDirs.clear();
+
+        const ARROW_DIR = { '↑': 'up', '↓': 'down', '←': 'left', '→': 'right' };
 
         for (const tile of tiles) {
             const key = `${tile.x},${tile.y}`;
             this.map.tiles.set(key, tile);
 
-            if (tile.type !== '0') this.map.walkable.add(key);
+            if (tile.type === '0') continue;
+
+            this.map.walkable.add(key);
             if (tile.type === '2') this.map.deliveryTiles.push(tile);
             if (tile.type === '1') this.map.spawnTiles.push(tile);
+
+            const dir = ARROW_DIR[tile.type];
+            if (dir) this.map.exitDirs.set(key, new Set([dir]));
         }
     }
 }

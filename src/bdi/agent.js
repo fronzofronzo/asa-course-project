@@ -1,12 +1,14 @@
 import 'dotenv/config'
 import { BeliefSet } from './belief.js';
-import { generateOptions, filterIntentions, go_to } from './deliberation.js';
+import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
+import { nearestDeliveryTile, nearestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
 const UTILITY_THRESHOLD = parseFloat(process.env.UTILITY_THRESHOLD) || 0;
 const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
+const DELIVERY_URGENCY = parseFloat(process.env.DELIVERY_URGENCY) || 30;
 
 class Agent {
     constructor() {
@@ -67,39 +69,71 @@ agent.socket.onSensing(({ agents, parcels }) => {
     agent._notifyBeliefChanged();
 })
 
+const visitedSpawns = new Set();
+
 async function agentLoop() {
     console.log('Agent loop started — waiting for first sensing...');
 
     while (true) {
         await agent.waitForBeliefChange();
 
-        if (agent.x === null) continue; // position not yet known
+        if (agent.x === null) continue;
 
         const agentPos = { x: agent.x, y: agent.y };
         const carriedCount = agent.carriedParcels.length;
+        const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
-        // D — desires
-        const desires = generateOptions(
-            agent.beliefs,
-            agentPos,
-            carriedCount,
-            DECAY,
-            UTILITY_THRESHOLD
-        );
+        // --- deliberation ---
 
-        // I — intention selection with hysteresis
+        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
         const newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
 
         if (newIntention?.parcel.id !== agent.intention?.parcel.id) {
             agent.intention = newIntention;
-            if (newIntention) {
-                console.log(`New intention → parcel ${newIntention.parcel.id} at (${newIntention.parcel.x},${newIntention.parcel.y}) U=${newIntention.utility.toFixed(2)}`);
-            } else {
-                console.log('No viable intention — idle.');
-            }
+            if (newIntention) console.log(`New intention → parcel ${newIntention.parcel.id} at (${newIntention.parcel.x},${newIntention.parcel.y}) U=${newIntention.utility.toFixed(2)}`);
+            else console.log('No viable intention.');
         }
 
-        // TODO: execute(agent.intention) — plan + act (planner.js)
+        // --- execution (one step per tick — re-deliberates every sensing event) ---
+
+        const shouldDeliver = carriedCount > 0 && (carriedReward >= DELIVERY_URGENCY || agent.intention === null);
+
+        if (shouldDeliver) {
+            const onDelivery = agent.beliefs.map.deliveryTiles
+                .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
+
+            if (onDelivery) {
+                const dropped = await agent.socket.emitPutdown();
+                console.log(`Delivered ${dropped.length} parcel(s)`);
+            } else {
+                const target = nearestDeliveryTile(agent);
+                if (target) await stepToward(target, agent);
+                else console.warn('No reachable delivery tile');
+            }
+
+        } else if (agent.intention !== null) {
+            const p = agent.intention.parcel;
+            const onParcel = Math.round(agent.x) === p.x && Math.round(agent.y) === p.y;
+
+            if (onParcel) {
+                const pickedUp = await agent.socket.emitPickup();
+                if (pickedUp?.length > 0) console.log(`Picked up ${pickedUp.length} parcel(s)`);
+                agent.intention = null;
+            } else {
+                const status = await stepToward({ x: p.x, y: p.y }, agent);
+                if (status === 'stuck') {
+                    console.warn(`Stuck going to parcel ${p.id}, dropping intention`);
+                    agent.intention = null;
+                }
+            }
+
+        } else {
+            const target = nearestSpawnTile(agent, visitedSpawns);
+            if (target) {
+                const status = await stepToward(target, agent);
+                if (status === 'arrived') visitedSpawns.add(`${target.x},${target.y}`);
+            }
+        }
     }
 }
 

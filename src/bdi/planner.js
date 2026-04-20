@@ -95,4 +95,40 @@ async function explore(agent, visitedSpawns) {
     return arrived;
 }
 
-export { go_pick_up, deliver, explore };
+/**
+ * Returns nearest reachable delivery tile, or null.
+ * @param {object} agent
+ * @returns {{ x:number, y:number } | null}
+ */
+function nearestDeliveryTile(agent) {
+    const { deliveryTiles, walkable } = agent.beliefs.map;
+    const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
+    let best = null, bestDist = Infinity;
+    for (const tile of deliveryTiles) {
+        const d = bfsDist(agentPos, tile, walkable);
+        if (d < bestDist) { bestDist = d; best = tile; }
+    }
+    return best;
+}
+
+/**
+ * Returns nearest reachable unvisited spawn tile (resets visited if all seen).
+ * @param {object} agent
+ * @param {Set<string>} visitedSpawns
+ * @returns {{ x:number, y:number } | null}
+ */
+function nearestSpawnTile(agent, visitedSpawns) {
+    const { spawnTiles, walkable } = agent.beliefs.map;
+    if (spawnTiles.length === 0) return null;
+    const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
+    const unvisited = spawnTiles.filter(t => !visitedSpawns.has(`${t.x},${t.y}`));
+    const candidates = unvisited.length > 0 ? unvisited : (visitedSpawns.clear(), spawnTiles);
+    let best = null, bestDist = Infinity;
+    for (const tile of candidates) {
+        const d = bfsDist(agentPos, tile, walkable);
+        if (d < bestDist) { bestDist = d; best = tile; }
+    }
+    return bestDist < Infinity ? best : null;
+}
+
+export { go_pick_up, deliver, explore, nearestDeliveryTile, nearestSpawnTile };
