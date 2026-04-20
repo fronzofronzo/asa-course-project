@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { BeliefSet } from './belief';
+import { BeliefSet } from './belief.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 
 
@@ -37,3 +37,11 @@ agent.socket.onMap((width, height, tiles) => {
 agent.socket.onYou(({id, name, x, y, score}) => {
     agent.updateInformation(id,name,x,y,score)
 })
+agent.socket.onSensing(({ agents, parcels }) => {
+    agent.beliefs.updateAgents(agents);
+    agent.beliefs.updateParcels(parcels);
+})
+
+// main loop
+
+setInterval(() => agent.beliefs.log(), 3000);
