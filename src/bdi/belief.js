@@ -8,6 +8,7 @@ class BeliefSet {
             spawnTiles: [],        // IOTile[] where type === '1'
             walkable: new Set(),   // Set of `${x},${y}` strings
         };
+        
     }
 
     /**
