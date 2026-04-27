@@ -140,12 +140,22 @@ function computePath(from, to, walkable, exitDirs, knownAgents) {
     const goalKey  = `${gx},${gy}`;
 
     if (startKey === goalKey) return [];
-    if (!walkable.has(goalKey)) return null;
+    if (!walkable.has(goalKey)) {
+        console.warn(`[PATHFIND] Target (${gx},${gy}) is not walkable`);
+        return null;
+    }
+    if (!walkable.has(startKey)) {
+        console.warn(`[PATHFIND] Start (${sx},${sy}) is not walkable`);
+        return null;
+    }
 
     const blocked = new Set(
         [...knownAgents.values()].map(a => `${Math.round(a.x)},${Math.round(a.y)}`)
     );
     blocked.delete(startKey);
+    if (blocked.size > 0) {
+        console.log(`[PATHFIND] ${blocked.size} agent(s) blocking`);
+    }
 
     const h = (x, y) => Math.abs(x - gx) + Math.abs(y - gy);
     const dirs = [
@@ -164,7 +174,10 @@ function computePath(from, to, walkable, exitDirs, knownAgents) {
         const [, g, x, y, path] = open.shift();
         const key = `${x},${y}`;
 
-        if (key === goalKey) return path;
+        if (key === goalKey) {
+            console.log(`[PATHFIND] ✓ Found path (${path.length} steps): [${path.slice(0, 10).join(',')}${path.length > 10 ? '...' : ''}]`);
+            return path;
+        }
         if ((visited.get(key) ?? Infinity) <= g) continue;
         visited.set(key, g);
 
@@ -179,6 +192,7 @@ function computePath(from, to, walkable, exitDirs, knownAgents) {
             open.push([ng + h(nx, ny), ng, nx, ny, [...path, dir]]);
         }
     }
+    console.warn(`[PATHFIND] ✗ No path found (open list exhausted) from (${sx},${sy}) to (${gx},${gy})`);
     return null;
 }
 
@@ -235,14 +249,30 @@ async function stepToward(target, agent) {
         agent.beliefs.agents
     );
 
-    if (path === null) return 'stuck';
-    if (path.length === 0) return 'arrived';
+    if (path === null) {
+        console.warn(`[PATHFIND] ✗ No path from (${Math.round(agent.x)},${Math.round(agent.y)}) to (${target.x},${target.y})`);
+        return 'stuck';
+    }
+    if (path.length === 0) {
+        console.log(`[PATHFIND] ✓ Already at target (${target.x},${target.y})`);
+        return 'arrived';
+    }
 
-    const result = await agent.socket.emitMove(path[0]);
-    if (result === false) return 'stuck';
+    const nextMove = path[0];
+    console.log(`[PATHFIND] Path: [${path.slice(0, 5).join(',')}${path.length > 5 ? '...' : ''}] (${path.length} steps) → next move: ${nextMove}`);
+    
+    const result = await agent.socket.emitMove(nextMove);
+    if (result === false) {
+        console.warn(`[MOVE] ✗ Move ${nextMove} failed at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+        return 'stuck';
+    }
 
+    const oldPos = `(${Math.round(agent.x)},${Math.round(agent.y)})`;
     agent.x = result.x;
     agent.y = result.y;
+    const newPos = `(${Math.round(agent.x)},${Math.round(agent.y)})`;
+
+    console.log(`[MOVE] ✓ ${nextMove}: ${oldPos} → ${newPos}`);
 
     if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
     return 'moved';

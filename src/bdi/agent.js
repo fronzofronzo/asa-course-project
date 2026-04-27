@@ -9,6 +9,7 @@ const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
 const UTILITY_THRESHOLD = parseFloat(process.env.UTILITY_THRESHOLD) || 0;
 const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
 const DELIVERY_URGENCY = parseFloat(process.env.DELIVERY_URGENCY) || 30;
+const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; // ms between re-deliberation
 
 class Agent {
     constructor() {
@@ -23,21 +24,26 @@ class Agent {
         this.carriedParcels = [];    // parcels currently carried
         this.stuckCount = 0;
 
-        /** @type {(() => void) | null} resolves when next sensing arrives */
-        this._beliefChangedResolve = null;
-        this._beliefChanged = new Promise(res => { this._beliefChangedResolve = res; });
+        /** Flag to trigger deliberation on next loop iteration */
+        this.needsDeliberation = false;
+        this.lastDeliberationTime = 0;
     }
 
-    /** Call after every belief update to unblock the main loop. */
+    /** Mark that a belief update has occurred. */
     _notifyBeliefChanged() {
-        const res = this._beliefChangedResolve;
-        this._beliefChanged = new Promise(r => { this._beliefChangedResolve = r; });
-        res?.();
+        this.needsDeliberation = true;
     }
 
-    /** Suspend loop until next sensing event. */
-    waitForBeliefChange() {
-        return this._beliefChanged;
+    /** Check if enough time has passed since last deliberation. */
+    shouldDeliberate() {
+        const now = Date.now();
+        return this.needsDeliberation || (now - this.lastDeliberationTime >= DELIBERATION_INTERVAL);
+    }
+
+    /** Record that deliberation just happened. */
+    recordDeliberation() {
+        this.needsDeliberation = false;
+        this.lastDeliberationTime = Date.now();
     }
 
     /**
@@ -72,44 +78,65 @@ agent.socket.onSensing(({ agents, parcels }) => {
 const visitedSpawns = new Set();
 
 async function agentLoop() {
-    console.log('Agent loop started — waiting for first sensing...');
+    console.log('Agent loop started — executing continuously with periodic deliberation...');
 
     while (true) {
-        await agent.waitForBeliefChange();
-
-        if (agent.x === null) continue;
+        // Wait for agent position to be set (first onYou callback)
+        if (agent.x === null) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+        }
 
         const agentPos = { x: agent.x, y: agent.y };
         const carriedCount = agent.carriedParcels.length;
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
-        // --- deliberation ---
+        // --- deliberation (periodic or on belief change) ---
+        if (agent.shouldDeliberate()) {
+            console.log(`\n[DELIBERATION] at (${Math.round(agent.x)},${Math.round(agent.y)}) | carried=${carriedCount} reward=${carriedReward.toFixed(1)}`);
+            const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
+            console.log(`[DELIBERATION] Found ${desires.length} viable parcel(s)`);
+            if (desires.length > 0) {
+                console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.parcel.id}@${d.parcel.x},${d.parcel.y} U=${d.utility.toFixed(1)})`).join(' | ')}`);
+            }
 
-        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
-        const newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
+            const newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
 
-        if (newIntention?.parcel.id !== agent.intention?.parcel.id) {
-            agent.intention = newIntention;
-            agent.stuckCount = 0;
-            if (newIntention) console.log(`New intention → parcel ${newIntention.parcel.id} at (${newIntention.parcel.x},${newIntention.parcel.y}) U=${newIntention.utility.toFixed(2)}`);
-            else console.log('No viable intention.');
+            if (newIntention?.parcel.id !== agent.intention?.parcel.id) {
+                agent.intention = newIntention;
+                agent.stuckCount = 0;
+                if (newIntention) {
+                    console.log(`[INTENTION] NEW: parcel ${newIntention.parcel.id} at (${newIntention.parcel.x},${newIntention.parcel.y}) U=${newIntention.utility.toFixed(2)}`);
+                } else {
+                    console.log('[INTENTION] CLEARED: no viable parcel');
+                }
+            } else if (agent.intention) {
+                console.log(`[INTENTION] HELD: parcel ${agent.intention.parcel.id} at (${agent.intention.parcel.x},${agent.intention.parcel.y}) U=${agent.intention.utility.toFixed(2)}`);
+            }
+            agent.recordDeliberation();
         }
 
-        // --- execution (one step per tick — re-deliberates every sensing event) ---
-
+        // --- execution (continuous, one step per iteration) ---
         const shouldDeliver = carriedCount > 0 && (carriedReward >= DELIVERY_URGENCY || agent.intention === null);
 
         if (shouldDeliver) {
+            console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
             const onDelivery = agent.beliefs.map.deliveryTiles
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
             if (onDelivery) {
                 const dropped = await agent.socket.emitPutdown();
-                console.log(`Delivered ${dropped.length} parcel(s)`);
+                console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
             } else {
                 const target = nearestDeliveryTile(agent);
-                if (target) await stepToward(target, agent);
-                else console.warn('No reachable delivery tile');
+                if (target) {
+                    console.log(`[EXECUTE] Moving to delivery (${target.x},${target.y})`);
+                    const status = await stepToward(target, agent);
+                    console.log(`[EXECUTE] Move result: ${status} now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                    if (status === 'stuck') agent.stuckCount++;
+                } else {
+                    console.warn('[EXECUTE] ✗ No reachable delivery tile');
+                }
             }
 
         } else if (agent.intention !== null) {
@@ -117,21 +144,53 @@ async function agentLoop() {
             const onParcel = Math.round(agent.x) === p.x && Math.round(agent.y) === p.y;
 
             if (onParcel) {
+                console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
                 const pickedUp = await agent.socket.emitPickup();
-                if (pickedUp?.length > 0) console.log(`Picked up ${pickedUp.length} parcel(s)`);
-                agent.intention = null;
-                agent.stuckCount = 0;
+                if (pickedUp?.length > 0) {
+                    console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);
+                    agent.intention = null;
+                    agent.stuckCount = 0;
+                } else {
+                    console.warn(`[EXECUTE] ✗ Pickup failed at (${p.x},${p.y}) - parcel may be gone`);
+                    agent.intention = null;
+                }
             } else {
-                agent.stuckCount = 0;
+                console.log(`[EXECUTE] Moving to parcel ${p.id} at (${p.x},${p.y}) (${Math.round(Math.sqrt((p.x - agent.x) ** 2 + (p.y - agent.y) ** 2))} steps away)`);
+                const status = await stepToward(p, agent);
+                console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                if (status === 'stuck') {
+                    agent.stuckCount++;
+                    console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach parcel ${p.id} at (${p.x},${p.y})`);
+                    if (agent.stuckCount > 5) {
+                        console.warn(`[STUCK] Clearing intention after ${agent.stuckCount} failed moves`);
+                        agent.intention = null;
+                        agent.stuckCount = 0;
+                    }
+                } else {
+                    agent.stuckCount = 0;
+                }
             }
 
         } else {
+            console.log(`[EXECUTE] EXPLORATION PHASE`);
             const target = nearestSpawnTile(agent, visitedSpawns);
             if (target) {
+                const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
+                console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
                 const status = await stepToward(target, agent);
+                console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'arrived') visitedSpawns.add(`${target.x},${target.y}`);
+                if (status === 'stuck') {
+                    console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);
+                    agent.stuckCount++;
+                }
+            } else {
+                console.warn('[EXECUTE] No spawn target found');
             }
         }
+
+        // Small delay to prevent busy-waiting
+        await new Promise(resolve => setTimeout(resolve, 50));
     }
 }
 
