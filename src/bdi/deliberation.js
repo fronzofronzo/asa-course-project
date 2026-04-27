@@ -241,6 +241,38 @@ async function go_to(target, agent) {
  * @returns {Promise<'arrived'|'moved'|'stuck'>}
  */
 async function stepToward(target, agent) {
+    const from = { x: agent.x, y: agent.y };
+    const to = target;
+    
+    const targetKey = `${to.x},${to.y}`;
+    const isWalkable = agent.beliefs.map.walkable.has(targetKey);
+    console.log(`[STEPTOWARD] Target (${to.x},${to.y}) walkable: ${isWalkable}`);
+    
+    if (!isWalkable) {
+        console.warn(`[STEPTOWARD] ✗ Target (${to.x},${to.y}) is NOT walkable!`);
+        return 'stuck';
+    }
+    
+    const rightTileX = Math.round(agent.x) + 1;
+    const rightTileY = Math.round(agent.y);
+    const rightKey = `${rightTileX},${rightTileY}`;
+    const rightTile = agent.beliefs.map.tiles.get(rightKey);
+    console.log(`[STEPTOWARD] Tile to the right (${rightKey}):`, rightTile ? `type=${rightTile.type}` : 'NO TILE');
+    console.log(`[STEPTOWARD] Is right tile walkable? ${agent.beliefs.map.walkable.has(rightKey)}`);
+    
+    console.log(`[STEPTOWARD] All tiles around (${Math.round(agent.x)},${Math.round(agent.y)}):`);
+    for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+            const key = `${Math.round(agent.x) + dx},${Math.round(agent.y) + dy}`;
+            const tile = agent.beliefs.map.tiles.get(key);
+            if (tile) {
+                console.log(`  (${tile.x},${tile.y}) type=${tile.type} walkable=${agent.beliefs.map.walkable.has(key)}`);
+            } else {
+                console.log(`  (${Math.round(agent.x) + dx},${Math.round(agent.y) + dy}) NO TILE DEFINED`);
+            }
+        }
+    }
+    
     const path = computePath(
         { x: agent.x, y: agent.y },
         target,
@@ -261,6 +293,23 @@ async function stepToward(target, agent) {
     const nextMove = path[0];
     console.log(`[PATHFIND] Path: [${path.slice(0, 5).join(',')}${path.length > 5 ? '...' : ''}] (${path.length} steps) → next move: ${nextMove}`);
     
+    let newX = Math.round(agent.x);
+    let newY = Math.round(agent.y);
+    switch(nextMove) {
+        case 'right': newX++; break;
+        case 'left': newX--; break;
+        case 'up': newY++; break;
+        case 'down': newY--; break;
+    }
+    const nextTileKey = `${newX},${newY}`;
+    const nextTileWalkable = agent.beliefs.map.walkable.has(nextTileKey);
+    console.log(`[STEPTOWARD] Next tile (${nextTileKey}) walkable: ${nextTileWalkable}`);
+    
+    if (!nextTileWalkable) {
+        console.warn(`[STEPTOWARD] ✗ Next move ${nextMove} leads to NON-walkable tile ${nextTileKey}!`);
+        return 'stuck';
+    }
+    
     const result = await agent.socket.emitMove(nextMove);
     if (result === false) {
         console.warn(`[MOVE] ✗ Move ${nextMove} failed at (${Math.round(agent.x)},${Math.round(agent.y)})`);
@@ -277,5 +326,4 @@ async function stepToward(target, agent) {
     if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
     return 'moved';
 }
-
 export { generateOptions, filterIntentions, bfsDist, distToNearestDelivery, computePath, go_to, stepToward };

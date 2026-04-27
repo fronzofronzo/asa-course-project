@@ -97,35 +97,35 @@ class BeliefSet {
     }
 
     /**
-     * @param {number} width
-     * @param {number} height
-     * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOTile').IOTile[]} tiles
-     */
-    updateMap(width, height, tiles) {
-        this.map.width = width;
-        this.map.height = height;
-        this.map.tiles.clear();
-        this.map.deliveryTiles = [];
-        this.map.spawnTiles = [];
-        this.map.walkable.clear();
-        this.map.exitDirs.clear();
+ * @param {number} width
+ * @param {number} height
+ * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOTile').IOTile[]} tiles
+ */
+updateMap(width, height, tiles) {
+    this.map.width = width;
+    this.map.height = height;
+    this.map.tiles.clear();
+    this.map.deliveryTiles = [];
+    this.map.spawnTiles = [];
+    this.map.walkable.clear();
+    this.map.exitDirs.clear();
 
-        const ARROW_DIR = { '↑': 'up', '↓': 'down', '←': 'left', '→': 'right' };
+    const ARROW_DIR = { '↑': 'up', '↓': 'down', '←': 'left', '→': 'right' };
 
-        for (const tile of tiles) {
-            const key = `${tile.x},${tile.y}`;
-            this.map.tiles.set(key, tile);
+    for (const tile of tiles) {
+        const key = `${tile.x},${tile.y}`;
+        this.map.tiles.set(key, tile);
 
-            if (tile.type === '0') continue;
+        if (tile.type === 0) continue;
 
-            this.map.walkable.add(key);
-            if (tile.type === '2') this.map.deliveryTiles.push(tile);
-            if (tile.type === '1') this.map.spawnTiles.push(tile);
+        this.map.walkable.add(key);
+        if (tile.type === 2) this.map.deliveryTiles.push(tile);
+        if (tile.type === 1) this.map.spawnTiles.push(tile);
 
-            const dir = ARROW_DIR[tile.type];
-            if (dir) this.map.exitDirs.set(key, new Set([dir]));
-        }
+        const dir = ARROW_DIR[tile.type];
+        if (dir) this.map.exitDirs.set(key, new Set([dir]));
     }
+}
 }
 
 BeliefSet.PARCEL_TTL_MS = 5000; // keep unseen parcel in beliefs for 5s
