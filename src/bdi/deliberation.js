@@ -58,18 +58,21 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
  * @param {number} decay
  * @returns {number}
  */
-function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay) {
-    const stepsToParcel = bfsDist(agentPos, parcel, walkable);
-    if (stepsToParcel === Infinity) return -Infinity;
-
-    const stepsToDelivery = distToNearestDelivery(parcel, deliveryTiles, walkable);
-    if (stepsToDelivery === Infinity) return -Infinity;
-
-    return parcel.reward
-        - decay * stepsToParcel
-        - decay * stepsToDelivery
-        - decay * stepsToParcel * carriedCount;
-}
+ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay) {
+      const stepsToParcel = bfsDist(agentPos, parcel, walkable);                                                                                                                                                        
+      if (stepsToParcel === Infinity) return -Infinity;
+                                                                                                                                                                                                                        
+      const stepsToDelivery = distToNearestDelivery(parcel, deliveryTiles, walkable);                                                                                                                                   
+      if (stepsToDelivery === Infinity) return -Infinity;
+                                                                                                                                                                                                                        
+      const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;                                                                                                                                                 
+      const currentReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
+                                                                                                                                                                                                                        
+      return currentReward
+          - decay * stepsToParcel
+          - decay * stepsToDelivery
+          - decay * stepsToParcel * carriedCount;
+} 
 
 /**
  * Generate desires: scored parcel options above threshold, sorted by utility desc.

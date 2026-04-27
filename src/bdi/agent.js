@@ -21,6 +21,7 @@ class Agent {
         this.socket = new DjsConnect();
         this.intention = null;       // { parcel, utility } | null
         this.carriedParcels = [];    // parcels currently carried
+        this.stuckCount = 0;
 
         /** @type {(() => void) | null} resolves when next sensing arrives */
         this._beliefChangedResolve = null;
@@ -62,12 +63,11 @@ agent.socket.onMap((width, height, tiles) => {
 agent.socket.onYou(({id, name, x, y, score}) => {
     agent.updateInformation(id,name,x,y,score)
 })
-agent.socket.onSensing(({ agents, parcels }) => {
-    agent.beliefs.updateAgents(agents);
-    agent.beliefs.updateParcels(parcels);
-    agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);
-    agent._notifyBeliefChanged();
-})
+agent.socket.onSensing(({ agents, parcels }) => {                                                                                                                                                                     
+      agent.beliefs.updateBeliefs({ agents, parcels });
+      agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);                                                                                                                                             
+      agent._notifyBeliefChanged();                                        
+}); 
 
 const visitedSpawns = new Set();
 
@@ -90,6 +90,7 @@ async function agentLoop() {
 
         if (newIntention?.parcel.id !== agent.intention?.parcel.id) {
             agent.intention = newIntention;
+            agent.stuckCount = 0;
             if (newIntention) console.log(`New intention → parcel ${newIntention.parcel.id} at (${newIntention.parcel.x},${newIntention.parcel.y}) U=${newIntention.utility.toFixed(2)}`);
             else console.log('No viable intention.');
         }
@@ -119,12 +120,9 @@ async function agentLoop() {
                 const pickedUp = await agent.socket.emitPickup();
                 if (pickedUp?.length > 0) console.log(`Picked up ${pickedUp.length} parcel(s)`);
                 agent.intention = null;
+                agent.stuckCount = 0;
             } else {
-                const status = await stepToward({ x: p.x, y: p.y }, agent);
-                if (status === 'stuck') {
-                    console.warn(`Stuck going to parcel ${p.id}, dropping intention`);
-                    agent.intention = null;
-                }
+                agent.stuckCount = 0;
             }
 
         } else {

@@ -67,6 +67,19 @@ class BeliefSet {
         }
     }
 
+     updateBeliefs({ agents, parcels }) {
+      const before = new Set(this.parcels.keys());                                                                                                                                                                      
+      this.updateAgents(agents);
+      this.updateParcels(parcels);
+      const after = new Set(this.parcels.keys());                                                                                                                                                                       
+   
+      const newParcels = [...after]                                                                                                                                                                                     
+          .filter(id => !before.has(id))
+          .map(id => this.parcels.get(id));
+      const lostParcelIds = [...before].filter(id => !after.has(id));                                                                                                                                                   
+      return { newParcels, lostParcelIds };
+    }   
+
     log() {
         console.log('--- BeliefSet ---');
         console.log(`Map: ${this.map.width}x${this.map.height} | walkable: ${this.map.walkable.size} | delivery: ${this.map.deliveryTiles.length} | spawn: ${this.map.spawnTiles.length}`);
