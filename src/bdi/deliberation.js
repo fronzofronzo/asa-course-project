@@ -49,16 +49,17 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
 
 /**
  * Compute utility for a parcel target.
- * U(p) = reward(p) - decay*steps_to_p - decay*steps_to_delivery(p) - decay*steps_to_p*carried_count
+ * U(p) = reward(p) - decay*steps_to_p - decay*steps_to_delivery(p) - decay*steps_to_p*carried_count - agent_proximity_penalty
  * @param {{ x:number, y:number, reward:number }} parcel
  * @param {{ x:number, y:number }} agentPos
  * @param {number} carriedCount
  * @param {{ x:number, y:number }[]} deliveryTiles
  * @param {Set<string>} walkable
  * @param {number} decay
+ * @param {Map<string, { id, name, x, y }>} otherAgents  other agents in sensing range
  * @returns {number}
  */
- function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay) {
+ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map()) {
       const stepsToParcel = bfsDist(agentPos, parcel, walkable);                                                                                                                                                        
       if (stepsToParcel === Infinity) return -Infinity;
                                                                                                                                                                                                                         
@@ -67,11 +68,22 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
                                                                                                                                                                                                                         
       const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;                                                                                                                                                 
       const currentReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
+      
+      // Compute penalty based on proximity of other agents to this parcel
+      let agentProximityPenalty = 0;
+      for (const agent of otherAgents.values()) {
+          const agentDistToParcel = bfsDist({ x: agent.x, y: agent.y }, parcel, walkable);
+          if (agentDistToParcel < Infinity) {
+              // Apply inverse distance penalty: closer agents cause bigger penalty
+              agentProximityPenalty += decay * (1 / (agentDistToParcel + 1));
+          }
+      }
                                                                                                                                                                                                                         
       return currentReward
           - decay * stepsToParcel
           - decay * stepsToDelivery
-          - decay * stepsToParcel * carriedCount;
+          - decay * stepsToParcel * carriedCount
+          - agentProximityPenalty;
 } 
 
 /**
@@ -89,7 +101,7 @@ function generateOptions(beliefs, agentPos, carriedCount, decay, threshold) {
 
     for (const parcel of beliefs.parcels.values()) {
         if (parcel.carriedBy !== null) continue; // already held by someone
-        const utility = computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay);
+        const utility = computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, beliefs.agents);
         if (utility > threshold) {
             desires.push({ parcel, utility });
         }
