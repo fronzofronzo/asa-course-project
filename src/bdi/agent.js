@@ -11,33 +11,15 @@ const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
 const DELIVERY_URGENCY = parseFloat(process.env.DELIVERY_URGENCY) || 30;
 const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; // ms between re-deliberation
 
-// Parse command line arguments: node agent.js [--host <host>] [--token <token>]
-function parseCommandLineArgs() {
-    const args = process.argv.slice(2);
-    const config = {};
-    
-    for (let i = 0; i < args.length; i++) {
-        if (args[i] === '--host' && i + 1 < args.length) {
-            config.host = args[i + 1];
-            i++;
-        } else if (args[i] === '--token' && i + 1 < args.length) {
-            config.token = args[i + 1];
-            i++;
-        }
-    }
-    
-    return config;
-}
-
 class Agent {
-    constructor(host, token) {
+    constructor() {
         this.beliefs = new BeliefSet();
         this.id = null;
         this.name = null;
         this.score = 0;
         this.x = null;
         this.y = null;
-        this.socket = DjsConnect(host, token);
+        this.socket = new DjsConnect();
         this.intention = null;       // { parcel, utility } | null
         this.carriedParcels = [];    // parcels currently carried
         this.stuckCount = 0;
@@ -80,12 +62,7 @@ class Agent {
     }
 }
 
-// Parse command line arguments and create agent
-const cmdArgs = parseCommandLineArgs();
-const host = cmdArgs.host || process.env.HOST || 'http://localhost:8080';
-const token = cmdArgs.token || process.env.TOKEN;
-
-const agent = new Agent(host, token);
+const agent = new Agent();
 agent.socket.onMap((width, height, tiles) => {
     agent.beliefs.updateMap(width, height, tiles);
 })

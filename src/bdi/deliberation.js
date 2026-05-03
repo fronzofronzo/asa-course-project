@@ -65,7 +65,7 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
                                                                                                                                                                                                                         
       const stepsToDelivery = distToNearestDelivery(parcel, deliveryTiles, walkable);                                                                                                                                   
       if (stepsToDelivery === Infinity) return -Infinity;
-                                                                                                                                                                                                            
+                                                                                                                                                                                                                        
       const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;                                                                                                                                                 
       const currentReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
       
