@@ -183,6 +183,11 @@ async function agentLoop() {
                 if (status === 'stuck') {
                     console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);
                     agent.stuckCount++;
+                    if (agent.stuckCount > 5) {
+                        console.warn(`[STUCK] stuckCount=${agent.stuckCount} > 5, marking spawn (${target.x},${target.y}) as visited`);
+                        visitedSpawns.add(`${target.x},${target.y}`);
+                        agent.stuckCount = 0;
+                    }
                 }
             } else {
                 console.warn('[EXECUTE] No spawn target found');
