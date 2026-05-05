@@ -116,15 +116,20 @@ updateMap(width, height, tiles) {
         const key = `${tile.x},${tile.y}`;
         this.map.tiles.set(key, tile);
 
-        if (tile.type === 0) continue;
+        if (tile.type == 0) continue;
 
         this.map.walkable.add(key);
-        if (tile.type === 2) this.map.deliveryTiles.push(tile);
-        if (tile.type === 1) this.map.spawnTiles.push(tile);
+        console.log(tile.type)
+        if (tile.type == 2) this.map.deliveryTiles.push(tile);
+        if (tile.type == 1) {
+            console.log("Questa è una spawining tile")
+            this.map.spawnTiles.push(tile);
+        }
 
         const dir = ARROW_DIR[tile.type];
         if (dir) this.map.exitDirs.set(key, new Set([dir]));
     }
+    console.log("Queste sono le spawn tiles", this.map.spawnTiles)
 }
 }
 
