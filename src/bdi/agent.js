@@ -70,9 +70,9 @@ agent.socket.onYou(({id, name, x, y, score}) => {
     agent.updateInformation(id,name,x,y,score)
 })
 agent.socket.onSensing(({ agents, parcels }) => {                                                                                                                                                                     
-      agent.beliefs.updateBeliefs({ agents, parcels });
-      agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);                                                                                                                                             
-      agent._notifyBeliefChanged();                                        
+    agent.beliefs.updateBeliefs({ agents, parcels });
+    agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);                                                                                                                                             
+    agent._notifyBeliefChanged();                                        
 }); 
 
 const visitedSpawns = new Set();
