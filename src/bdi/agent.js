@@ -8,7 +8,6 @@ import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
 const UTILITY_THRESHOLD = parseFloat(process.env.UTILITY_THRESHOLD) || 0;
 const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
-const DELIVERY_URGENCY = parseFloat(process.env.DELIVERY_URGENCY) || 30;
 const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; // ms between re-deliberation
 
 class Agent {
@@ -91,10 +90,12 @@ async function agentLoop() {
         const carriedCount = agent.carriedParcels.length;
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
-        // --- deliberation (periodic or on belief change) ---
-        if (agent.shouldDeliberate()) {
+        // Always compute desires so shouldDeliver has accurate parcel count
+        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
+
+        // --- deliberation (periodic, on belief change, or when intention just cleared) ---
+        if (agent.shouldDeliberate() || agent.intention == null) {
             console.log(`\n[DELIBERATION] at (${Math.round(agent.x)},${Math.round(agent.y)}) | carried=${carriedCount} reward=${carriedReward.toFixed(1)}`);
-            const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
             console.log(`[DELIBERATION] Found ${desires.length} viable parcel(s)`);
             if (desires.length > 0) {
                 console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.parcel.id}@${d.parcel.x},${d.parcel.y} U=${d.utility.toFixed(1)})`).join(' | ')}`);
@@ -117,7 +118,9 @@ async function agentLoop() {
         }
 
         // --- execution (continuous, one step per iteration) ---
-        const shouldDeliver = carriedCount > 0 && (carriedReward >= DELIVERY_URGENCY || agent.intention === null);
+        // Deliver only when deliberation found no parcel worth pursuing.
+        // DELIVERY_URGENCY applies inside utility: high carriedReward makes picking up detours less attractive.
+        const shouldDeliver = carriedCount > 0 && agent.intention === null;
 
         if (shouldDeliver) {
             console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
@@ -127,6 +130,7 @@ async function agentLoop() {
             if (onDelivery) {
                 const dropped = await agent.socket.emitPutdown();
                 console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                visitedSpawns.clear();
             } else {
                 const target = nearestDeliveryTile(agent);
                 if (target) {
