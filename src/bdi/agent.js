@@ -145,7 +145,8 @@ async function agentLoop() {
 
         } else if (agent.intention !== null) {
             const p = agent.intention.parcel;
-            const onParcel = Math.round(agent.x) === p.x && Math.round(agent.y) === p.y;
+            const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
+            const onParcel = isStable && agent.x === p.x && agent.y === p.y;
 
             if (onParcel) {
                 console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
@@ -155,7 +156,8 @@ async function agentLoop() {
                     agent.intention = null;
                     agent.stuckCount = 0;
                 } else {
-                    console.warn(`[EXECUTE] ✗ Pickup failed at (${p.x},${p.y}) - parcel may be gone`);
+                    console.warn(`[EXECUTE] ✗ Pickup failed at (${p.x},${p.y}) - removing from beliefs`);
+                    agent.beliefs.parcels.delete(p.id);
                     agent.intention = null;
                 }
             } else {
