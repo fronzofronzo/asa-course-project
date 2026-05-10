@@ -67,18 +67,28 @@ class BeliefSet {
         }
     }
 
-     updateBeliefs({ agents, parcels }) {
-      const before = new Set(this.parcels.keys());                                                                                                                                                                      
-      this.updateAgents(agents);
-      this.updateParcels(parcels);
-      const after = new Set(this.parcels.keys());                                                                                                                                                                       
-   
-      const newParcels = [...after]                                                                                                                                                                                     
-          .filter(id => !before.has(id))
-          .map(id => this.parcels.get(id));
-      const lostParcelIds = [...before].filter(id => !after.has(id));                                                                                                                                                   
-      return { newParcels, lostParcelIds };
-    }   
+    updateBeliefs({ agents, parcels }) {
+        const before = new Set(this.parcels.keys());
+        this.updateAgents(agents);
+        this.updateParcels(parcels);
+        this.updateSpawnAgentCounts();
+        const after = new Set(this.parcels.keys());
+
+        const newParcels = [...after]
+            .filter(id => !before.has(id))
+            .map(id => this.parcels.get(id));
+        const lostParcelIds = [...before].filter(id => !after.has(id));
+        return { newParcels, lostParcelIds };
+    }
+
+    updateSpawnAgentCounts() {
+        const agents = [...this.agents.values()];
+        for (const tile of this.map.spawnTiles) {
+            tile.nearbyAgentCount = agents.filter(a =>
+                Math.abs(a.x - tile.x) + Math.abs(a.y - tile.y) <= BeliefSet.SPAWN_AGENT_RADIUS
+            ).length;
+        }
+    }
 
     log() {
         console.log('--- BeliefSet ---');
@@ -134,5 +144,6 @@ updateMap(width, height, tiles) {
 }
 
 BeliefSet.PARCEL_TTL_MS = 5000; // keep unseen parcel in beliefs for 5s
+BeliefSet.SPAWN_AGENT_RADIUS = 3; // Manhattan radius to count nearby agents per spawn tile
 
 export { BeliefSet };

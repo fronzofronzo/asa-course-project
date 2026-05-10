@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import { BeliefSet } from './belief.js';
 import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
-import { nearestDeliveryTile, nearestSpawnTile } from './planner.js';
+import { nearestDeliveryTile, bestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 
 
@@ -173,7 +173,7 @@ async function agentLoop() {
 
         } else {
             console.log(`[EXECUTE] EXPLORATION PHASE`);
-            const target = nearestSpawnTile(agent, visitedSpawns);
+            const target = bestSpawnTile(agent, visitedSpawns);
             if (target) {
                 const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
                 console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
