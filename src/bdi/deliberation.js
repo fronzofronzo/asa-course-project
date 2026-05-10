@@ -82,7 +82,6 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
       return currentReward
           - decay * stepsToParcel
           - decay * stepsToDelivery
-          - decay * stepsToParcel * carriedCount
           - agentProximityPenalty;
 } 
 
