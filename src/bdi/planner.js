@@ -55,14 +55,15 @@ async function deliver(agent) {
     return true;
 }
 
-const SPAWN_W_AGENTS = 0.3; // penalty weight per nearby agent
+const SPAWN_W_AGENTS   = 0.3;
+const SPAWN_W_RECENCY  = 2;
+const SPAWN_RECENCY_WINDOW_MS = 15000; // tune to server parcel interval
 
 /**
- * Move toward best unvisited spawn tile (highest utility score).
- * Marks tile visited once reached. Resets visited set when all tiles explored.
- * Returns true when a new tile is reached, false if unreachable.
+ * Move toward best spawn tile (highest utility score).
+ * Records visit timestamp on arrival.
  * @param {object} agent
- * @param {Set<string>} visitedSpawns  shared set tracking visited spawn keys
+ * @param {Map<string, number>} visitedSpawns  key → timestamp of last visit
  * @returns {Promise<boolean>}
  */
 async function explore(agent, visitedSpawns) {
@@ -75,7 +76,7 @@ async function explore(agent, visitedSpawns) {
 
     const arrived = await go_to({ x: best.x, y: best.y }, agent);
     if (arrived) {
-        visitedSpawns.add(`${best.x},${best.y}`);
+        visitedSpawns.set(`${best.x},${best.y}`, Date.now());
         console.log(`Explored spawn tile (${best.x},${best.y})`);
     }
     return arrived;
@@ -98,24 +99,28 @@ function nearestDeliveryTile(agent) {
 }
 
 /**
- * Returns best reachable unvisited spawn tile by utility score.
- * score = 1/(dist+1) - SPAWN_W_AGENTS * nearbyAgentCount
- * Resets visited set when all tiles have been seen.
+ * Returns best reachable spawn tile by utility score.
+ * score = 1/(dist+1) - SPAWN_W_AGENTS * nearbyAgentCount - SPAWN_W_RECENCY * recencyPenalty
+ * recencyPenalty decays from 1 (just visited) to 0 after SPAWN_RECENCY_WINDOW_MS.
  * @param {object} agent
- * @param {Set<string>} visitedSpawns
+ * @param {Map<string, number>} visitedSpawns  key → timestamp of last visit
  * @returns {{ x:number, y:number } | null}
  */
 function bestSpawnTile(agent, visitedSpawns) {
     const { spawnTiles, walkable } = agent.beliefs.map;
     if (spawnTiles.length === 0) return null;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
-    const unvisited = spawnTiles.filter(t => !visitedSpawns.has(`${t.x},${t.y}`));
-    const candidates = unvisited.length > 0 ? unvisited : (visitedSpawns.clear(), spawnTiles);
+    const now = Date.now();
     let best = null, bestScore = -Infinity;
-    for (const tile of candidates) {
+    for (const tile of spawnTiles) {
         const dist = bfsDist(agentPos, tile, walkable);
         if (dist === Infinity) continue;
-        const score = 1 / (dist + 1) - SPAWN_W_AGENTS * (tile.nearbyAgentCount ?? 0);
+        const key = `${tile.x},${tile.y}`;
+        const timeSince = now - (visitedSpawns.get(key) ?? 0);
+        const recencyPenalty = Math.max(0, 1 - timeSince / SPAWN_RECENCY_WINDOW_MS);
+        const score = 1 / (dist + 1)
+                    - SPAWN_W_AGENTS  * (tile.nearbyAgentCount ?? 0)
+                    - SPAWN_W_RECENCY * recencyPenalty;
         if (score > bestScore) { bestScore = score; best = tile; }
     }
     return best;

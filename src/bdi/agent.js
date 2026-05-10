@@ -74,7 +74,7 @@ agent.socket.onSensing(({ agents, parcels }) => {
     agent._notifyBeliefChanged();                                        
 }); 
 
-const visitedSpawns = new Set();
+const visitedSpawns = new Map(); // key → timestamp of last visit
 
 async function agentLoop() {
     console.log('Agent loop started — executing continuously with periodic deliberation...');
@@ -130,7 +130,6 @@ async function agentLoop() {
             if (onDelivery) {
                 const dropped = await agent.socket.emitPutdown();
                 console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                visitedSpawns.clear();
             } else {
                 const target = nearestDeliveryTile(agent);
                 if (target) {
@@ -183,13 +182,13 @@ async function agentLoop() {
                 console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
                 const status = await stepToward(target, agent);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                if (status === 'arrived') visitedSpawns.add(`${target.x},${target.y}`);
+                if (status === 'arrived') visitedSpawns.set(`${target.x},${target.y}`, Date.now());
                 if (status === 'stuck') {
                     console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);
                     agent.stuckCount++;
                     if (agent.stuckCount > 5) {
                         console.warn(`[STUCK] stuckCount=${agent.stuckCount} > 5, marking spawn (${target.x},${target.y}) as visited`);
-                        visitedSpawns.add(`${target.x},${target.y}`);
+                        visitedSpawns.set(`${target.x},${target.y}`, Date.now());
                         agent.stuckCount = 0;
                     }
                 }
