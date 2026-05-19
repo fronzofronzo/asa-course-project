@@ -144,7 +144,8 @@ async function agentLoop() {
 
         } else if (agent.intention !== null) {
             const p = agent.intention.parcel;
-            const onParcel = Math.round(agent.x) === p.x && Math.round(agent.y) === p.y;
+            const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
+            const onParcel = isStable && agent.x === p.x && agent.y === p.y;
 
             if (onParcel) {
                 console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
