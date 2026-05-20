@@ -1,3 +1,7 @@
+import { bfsDist } from './utils.js';
+
+const LAMBDA = 0.3;
+
 class BeliefSet {
     constructor() {
         this.map = {
@@ -9,8 +13,8 @@ class BeliefSet {
             walkable: new Set(),   // Set of `${x},${y}` strings
             exitDirs: new Map(),   // key: `${x},${y}` → Set of allowed exit directions ('up'|'down'|'left'|'right'); absent = all directions allowed
         };
-        this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen }
-        this.agents = new Map();   // id → { id, name, x, y, score, lastSeen }
+        this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
+        this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
     }
 
     /**
@@ -29,13 +33,19 @@ class BeliefSet {
                 reward: p.reward,
                 carriedBy: p.carriedBy ?? null,
                 lastSeen: now,
+                beliefScore: 1.0,
+                inRange: true,
             });
         }
 
-        // prune: reward exhausted OR unseen longer than TTL
+        // prune: reward exhausted OR unseen longer than TTL; mark survivors as out-of-range
         for (const [id, parcel] of this.parcels) {
-            if (!seen.has(id) && (parcel.reward <= 0 || now - parcel.lastSeen > BeliefSet.PARCEL_TTL_MS)) {
-                this.parcels.delete(id);
+            if (!seen.has(id)) {
+                if (parcel.reward <= 0 || now - parcel.lastSeen > BeliefSet.PARCEL_TTL_MS) {
+                    this.parcels.delete(id);
+                } else {
+                    parcel.inRange = false;
+                }
             }
         }
     }
@@ -59,9 +69,9 @@ class BeliefSet {
             });
         }
 
-        // remove agents no longer in sensing range (mark uncertain via lastSeen age)
-        for (const [id] of this.agents) {
-            if (!seen.has(id)) {
+        // keep recently-seen agents for opponent proximity calculation in uncertainty estimation
+        for (const [id, ag] of this.agents) {
+            if (!seen.has(id) && now - ag.lastSeen > BeliefSet.AGENT_TTL_MS) {
                 this.agents.delete(id);
             }
         }
@@ -80,13 +90,50 @@ class BeliefSet {
       return { newParcels, lostParcelIds };
     }   
 
+    /**
+     * Recompute beliefScore for every out-of-range parcel.
+     * Call once per BDI cycle, after updateBeliefs().
+     * @param {{ x:number, y:number }} agentPos  own stable (integer) position
+     */
+    updateParcelUncertainty(agentPos) {
+        const now = Date.now();
+        for (const parcel of this.parcels.values()) {
+            if (parcel.inRange) {
+                parcel.beliefScore = 1.0;
+                continue;
+            }
+
+            const distMe = bfsDist(
+                { x: Math.round(agentPos.x), y: Math.round(agentPos.y) },
+                { x: parcel.x, y: parcel.y },
+                this.map.walkable
+            );
+            const deltaT = (now - parcel.lastSeen) / 1000;
+            const D = distMe === Infinity ? 0 : Math.exp(-LAMBDA * distMe * deltaT);
+
+            let minOppDist = Infinity;
+            for (const ag of this.agents.values()) {
+                const d = bfsDist(
+                    { x: Math.round(ag.x), y: Math.round(ag.y) },
+                    { x: parcel.x, y: parcel.y },
+                    this.map.walkable
+                );
+                if (d < minOppDist) minOppDist = d;
+            }
+            const R = minOppDist === Infinity ? 0 : 1 - Math.exp(-LAMBDA * minOppDist);
+
+            parcel.beliefScore = D * (1 - R);
+        }
+    }
+
     log() {
         console.log('--- BeliefSet ---');
         console.log(`Map: ${this.map.width}x${this.map.height} | walkable: ${this.map.walkable.size} | delivery: ${this.map.deliveryTiles.length} | spawn: ${this.map.spawnTiles.length}`);
         console.log(`Parcels (${this.parcels.size}):`);
         for (const p of this.parcels.values()) {
             const age = Math.round((Date.now() - p.lastSeen) / 1000);
-            console.log(`  [${p.id}] (${p.x},${p.y}) reward=${p.reward} carriedBy=${p.carriedBy ?? 'none'} age=${age}s`);
+            const bs  = p.beliefScore?.toFixed(3) ?? '1.000';
+            console.log(`  [${p.id}] (${p.x},${p.y}) reward=${p.reward} carriedBy=${p.carriedBy ?? 'none'} age=${age}s belief=${bs} inRange=${p.inRange}`);
         }
         console.log(`Agents (${this.agents.size}):`);
         for (const a of this.agents.values()) {
@@ -133,6 +180,7 @@ updateMap(width, height, tiles) {
 }
 }
 
-BeliefSet.PARCEL_TTL_MS = 5000; // keep unseen parcel in beliefs for 5s
+BeliefSet.PARCEL_TTL_MS = 5000;
+BeliefSet.AGENT_TTL_MS  = 2000;
 
 export { BeliefSet };

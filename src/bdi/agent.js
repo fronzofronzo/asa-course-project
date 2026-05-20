@@ -68,11 +68,14 @@ agent.socket.onMap((width, height, tiles) => {
 agent.socket.onYou(({id, name, x, y, score}) => {
     agent.updateInformation(id,name,x,y,score)
 })
-agent.socket.onSensing(({ agents, parcels }) => {                                                                                                                                                                     
+agent.socket.onSensing(({ agents, parcels }) => {
     agent.beliefs.updateBeliefs({ agents, parcels });
-    agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);                                                                                                                                             
-    agent._notifyBeliefChanged();                                        
-}); 
+    if (agent.x !== null) {
+        agent.beliefs.updateParcelUncertainty({ x: agent.x, y: agent.y });
+    }
+    agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);
+    agent._notifyBeliefChanged();
+});
 
 const visitedSpawns = new Set();
 

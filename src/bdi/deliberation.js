@@ -1,35 +1,4 @@
-/**
- * BFS shortest-path distance on the walkability graph.
- * Returns Infinity if unreachable.
- * @param {{ x:number, y:number }} from
- * @param {{ x:number, y:number }} to
- * @param {Set<string>} walkable
- * @returns {number}
- */
-function bfsDist(from, to, walkable) {
-    const goal = `${to.x},${to.y}`;
-    const start = `${from.x},${from.y}`;
-    if (start === goal) return 0;
-    if (!walkable.has(start) || !walkable.has(goal)) return Infinity;
-
-    const queue = [[from.x, from.y, 0]];
-    const visited = new Set([start]);
-    const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
-
-    while (queue.length) {
-        const [x, y, d] = queue.shift();
-        for (const [dx, dy] of dirs) {
-            const nx = x + dx, ny = y + dy;
-            const key = `${nx},${ny}`;
-            if (key === goal) return d + 1;
-            if (!visited.has(key) && walkable.has(key)) {
-                visited.add(key);
-                queue.push([nx, ny, d + 1]);
-            }
-        }
-    }
-    return Infinity;
-}
+import { bfsDist } from './utils.js';
 
 /**
  * Nearest delivery tile distance from a given position.
@@ -59,31 +28,29 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
  * @param {Map<string, { id, name, x, y }>} otherAgents  other agents in sensing range
  * @returns {number}
  */
- function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map()) {
-      const stepsToParcel = bfsDist(agentPos, parcel, walkable);                                                                                                                                                        
-      if (stepsToParcel === Infinity) return -Infinity;
-                                                                                                                                                                                                                        
-      const stepsToDelivery = distToNearestDelivery(parcel, deliveryTiles, walkable);                                                                                                                                   
-      if (stepsToDelivery === Infinity) return -Infinity;
-                                                                                                                                                                                                                        
-      const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;                                                                                                                                                 
-      const currentReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
-      
-      // Compute penalty based on proximity of other agents to this parcel
-      let agentProximityPenalty = 0;
-      for (const agent of otherAgents.values()) {
-          const agentDistToParcel = bfsDist({ x: agent.x, y: agent.y }, parcel, walkable);
-          if (agentDistToParcel < Infinity) {
-              // Apply inverse distance penalty: closer agents cause bigger penalty
-              agentProximityPenalty += decay * (1 / (agentDistToParcel + 1));
-          }
-      }
-                                                                                                                                                                                                                        
-      return currentReward
-          - decay * stepsToParcel
-          - decay * stepsToDelivery
-          - agentProximityPenalty;
-} 
+const BELIEF_THRESHOLD = 0.1;
+
+function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map()) {
+    // parcel with low belief score is probably gone — skip immediately
+    if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
+
+    const stepsToParcel = bfsDist(agentPos, parcel, walkable);
+    if (stepsToParcel === Infinity) return -Infinity;
+
+    const stepsToDelivery = distToNearestDelivery(parcel, deliveryTiles, walkable);
+    if (stepsToDelivery === Infinity) return -Infinity;
+
+    // gameReward: actual reward the server will give if we reach the parcel now
+    const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;
+    const gameReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
+
+    // effectiveReward: expected value = gameReward * P(parcel still exists)
+    const effectiveReward = gameReward * (parcel.beliefScore ?? 1.0);
+
+    return effectiveReward
+        - decay * stepsToParcel
+        - decay * stepsToDelivery;
+}
 
 /**
  * Generate desires: scored parcel options above threshold, sorted by utility desc.
