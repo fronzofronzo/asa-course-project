@@ -39,14 +39,24 @@ const me = {
     score: 0,
 };
 
-// Update LLM agent information
-socket.onYou((you) => {
-    me.id = you.id;
-    me.name = you.name;
-    me.x = you.x;
-    me.y = you.y;
-    me.score = you.score;
-})
+// Last sensing snapshot — updated on every onSensing event
+const world = {
+    parcels: [],  // IOParcel[] from last sensing
+    agents: [],   // IOAgent[] from last sensing (excluding self)
+};
+
+socket.onYou(({ id, name, x, y, score }) => {
+    me.id = id;
+    me.name = name;
+    me.x = x;
+    me.y = y;
+    me.score = score;
+});
+
+socket.onSensing(({ agents, parcels }) => {
+    world.parcels = parcels ?? [];
+    world.agents  = (agents ?? []).filter(a => a.id !== me.id);
+});
 
 // Tools 
 function calculate(expression) {
@@ -141,12 +151,155 @@ async function move(direction) {
   }
 }
 
-// Tool registry -> It is an object that maps the tool name used by the model to the acual function implemented in the program
+// Returns current position, score, carried parcels and nearby agents
+async function getWorldState() {
+  console.log("---- GET WORLD STATE ----");
+
+  if (me.x === null || me.y === null) {
+    return "Error: agent position not available yet.";
+  }
+
+  const carried = world.parcels.filter(p => p.carriedBy === me.id);
+
+  return JSON.stringify({
+    position: { x: me.x, y: me.y },
+    score: me.score,
+    carried_parcels: carried.map(p => ({ id: p.id, reward: p.reward })),
+    nearby_agents: world.agents.map(a => ({ id: a.id, name: a.name, x: a.x, y: a.y })),
+  });
+}
+
+// Returns all free (unclaimed) parcels visible in sensing range, sorted by distance
+async function getParcels() {
+  console.log("---- GET PARCELS ----");
+
+  if (me.x === null || me.y === null) {
+    return "Error: agent position not available yet.";
+  }
+
+  const free = world.parcels.filter(p => !p.carriedBy);
+
+  if (free.length === 0) {
+    return "No free parcels visible right now.";
+  }
+
+  const withDist = free.map(p => ({
+    id: p.id,
+    x: p.x,
+    y: p.y,
+    reward: p.reward,
+    distance: Math.abs(p.x - me.x) + Math.abs(p.y - me.y),
+  }));
+
+  withDist.sort((a, b) => a.distance - b.distance);
+
+  return JSON.stringify(withDist);
+}
+
+// Navigates to (x, y) using sequential moves (up/down/left/right), no A*
+// Tries primary axis (larger delta) first; falls back to secondary if blocked
+async function navigateTo(args) {
+  console.log("---- NAVIGATE TO ----");
+
+  let tx, ty;
+  try {
+    const parsed = JSON.parse(args);
+    tx = parsed.x;
+    ty = parsed.y;
+  } catch {
+    return 'Error: navigate_to expects JSON like {"x": 3, "y": 5}';
+  }
+
+  if (typeof tx !== "number" || typeof ty !== "number") {
+    return "Error: x and y must be numbers.";
+  }
+
+  tx = Math.round(tx);
+  ty = Math.round(ty);
+
+  const MAX_STEPS = 100;
+  let steps = 0;
+
+  while (steps < MAX_STEPS) {
+    const cx = Math.round(me.x);
+    const cy = Math.round(me.y);
+
+    if (cx === tx && cy === ty) {
+      return `Arrived at (${tx}, ${ty}).`;
+    }
+
+    const dx = tx - cx;
+    const dy = ty - cy;
+
+    const primaryDir = Math.abs(dx) >= Math.abs(dy)
+      ? (dx > 0 ? "right" : "left")
+      : (dy > 0 ? "up" : "down");
+
+    const altDir = Math.abs(dx) < Math.abs(dy)
+      ? (dx > 0 ? "right" : "left")
+      : (dy > 0 ? "up" : "down");
+
+    const result = await socket.emitMove(primaryDir);
+    steps++;
+
+    if (!result) {
+      const altResult = await socket.emitMove(altDir);
+      steps++;
+
+      if (!altResult) {
+        return `Error: stuck at (${Math.round(me.x)}, ${Math.round(me.y)}) navigating to (${tx}, ${ty}). Both axes blocked.`;
+      }
+    }
+  }
+
+  return `Error: could not reach (${tx}, ${ty}) within ${MAX_STEPS} steps. Stopped at (${Math.round(me.x)}, ${Math.round(me.y)}).`;
+}
+
+// Picks up all parcels at the current tile
+async function pickUp() {
+  console.log("---- PICK UP ----");
+
+  try {
+    const result = await socket.emitPickup();
+
+    if (result && result.length > 0) {
+      return `Picked up ${result.length} parcel(s): ${JSON.stringify(result.map(p => ({ id: p.id, reward: p.reward })))}.`;
+    }
+
+    return "No parcels to pick up at current position.";
+  } catch (error) {
+    return `Error: ${error.message}`;
+  }
+}
+
+// Puts down all carried parcels at the current tile (scores if it's a delivery tile)
+async function putDown() {
+  console.log("---- PUT DOWN ----");
+
+  try {
+    const result = await socket.emitPutdown();
+
+    if (result && result.length > 0) {
+      return `Delivered ${result.length} parcel(s): ${JSON.stringify(result.map(p => ({ id: p.id, reward: p.reward })))}.`;
+    }
+
+    return "No parcels to put down, or not on a delivery tile.";
+  } catch (error) {
+    return `Error: ${error.message}`;
+  }
+}
+
+// Tool registry -> It is an object that maps the tool name used by the model to the actual function implemented in the program
 const TOOLS = {
     calculate,
     get_current_time: getCurrentTime,
     get_my_position: getMyPosition,
     move,
+    get_world_state: getWorldState,
+    get_parcels: getParcels,
+    navigate_to: navigateTo,
+    pick_up: pickUp,
+    put_down: putDown,
 };
 
 // Reusable LLM call -> it allows to reuse code, it is a wrapper
@@ -205,6 +358,11 @@ Available tools:
 - get_current_time(location): returns the current local time for Rome/Roma
 - get_my_position(): returns the agent's current x, y coordinates and score
 - move(direction): moves the agent one step in one direction: up, down, left, or right
+- get_world_state(): returns position, score, carried parcels, and nearby agents
+- get_parcels(): returns all free (unclaimed) parcels in sensing range, sorted by distance
+- navigate_to({"x": <number>, "y": <number>}): navigates to target tile using sequential moves
+- pick_up(): picks up all parcels at the current tile
+- put_down(): puts down all carried parcels (scores points if on a delivery tile)
 
 Movement rules:
 - move(up) increases y by 1
@@ -214,6 +372,12 @@ Movement rules:
 - move can move only one step at a time
 - if the user asks to move multiple steps, call move once for each step
 - to check the current position, call get_my_position with Action Input: none
+- navigate_to handles multi-step navigation automatically — prefer it over repeated move calls
+
+Game rules:
+- pick_up collects parcels at your current tile; navigate there first
+- put_down scores points only on delivery tiles; navigate there first
+- parcel rewards decay over time — act quickly
 
 You solve the user's request step by step.
 
@@ -245,6 +409,8 @@ Rules:
 - If the user asks where the agent is, call get_my_position before answering.
 - If the user asks to move, call move once for each movement step.
 - If the user asks for the final position after moving, call get_my_position after the movements.
+- If the user asks to pick up a parcel, navigate to it first, then call pick_up.
+- If the user asks to deliver parcels, navigate to a delivery tile first, then call put_down.
 - If the user asks for multiple things, solve one thing at a time.
 - After receiving an Observation, check whether the original user request still has unresolved parts.
 - Only give Final Answer when all required tool results have been observed.
