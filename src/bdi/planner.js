@@ -117,4 +117,17 @@ function nearestSpawnTile(agent, visitedSpawns) {
     return best;
 }
 
+function hottestSpawnTile(agent, visitedSpawns) {
+    const { spawnTiles, spawnHeat } = agent.beliefs.map;
+    if (spawnTiles.length === 0) return null;
+    const unvisited = spawnTiles.filter(t => !visitedSpawns.has(`${t.x},${t.y}`));
+    const candidates = unvisited.length > 0 ? unvisited : spawnTiles;
+    let best = null, bestHeat = -Infinity;
+    for (const tile of candidates) {
+        const heat = spawnHeat.get(`${tile.x},${tile.y}`);
+        if (heat > bestHeat) { bestHeat = heat; best = tile; }
+    }
+    return best;
+}
+
 export { go_pick_up, deliver, explore, nearestDeliveryTile, nearestSpawnTile };

@@ -12,6 +12,7 @@ class BeliefSet {
             spawnTiles: [],        // IOTile[] where type === '1'
             walkable: new Set(),   // Set of `${x},${y}` strings
             exitDirs: new Map(),   // key: `${x},${y}` → Set of allowed exit directions ('up'|'down'|'left'|'right'); absent = all directions allowed
+            spawnHeat: new Map(),  // key: `${x},${y}` → heat value (0-1)
         };
         this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
         this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
@@ -171,6 +172,7 @@ updateMap(width, height, tiles) {
         if (tile.type == 1) {
             console.log("Questa è una spawining tile")
             this.map.spawnTiles.push(tile);
+            this.map.spawnHeat.set(key, computeSpawnHeat(tile, tiles, 3));
         }
 
         const dir = ARROW_DIR[tile.type];
