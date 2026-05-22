@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import { BeliefSet } from './belief.js';
 import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
-import { nearestDeliveryTile, bestSpawnTile } from './planner.js';
+import { nearestDeliveryTile, nearestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 
 
@@ -68,11 +68,14 @@ agent.socket.onMap((width, height, tiles) => {
 agent.socket.onYou(({id, name, x, y, score}) => {
     agent.updateInformation(id,name,x,y,score)
 })
-agent.socket.onSensing(({ agents, parcels }) => {                                                                                                                                                                     
+agent.socket.onSensing(({ agents, parcels }) => {
     agent.beliefs.updateBeliefs({ agents, parcels });
-    agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);                                                                                                                                             
-    agent._notifyBeliefChanged();                                        
-}); 
+    if (agent.x !== null) {
+        agent.beliefs.updateParcelUncertainty({ x: agent.x, y: agent.y });
+    }
+    agent.carriedParcels = parcels.filter(p => p.carriedBy === agent.id);
+    agent._notifyBeliefChanged();
+});
 
 const visitedSpawns = new Map(); // key → timestamp of last visit
 
@@ -177,7 +180,7 @@ async function agentLoop() {
 
         } else {
             console.log(`[EXECUTE] EXPLORATION PHASE`);
-            const target = bestSpawnTile(agent, visitedSpawns);
+            const target = nearestSpawnTile(agent, visitedSpawns);
             if (target) {
                 const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
                 console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);

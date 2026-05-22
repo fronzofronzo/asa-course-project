@@ -1,4 +1,5 @@
-import { go_to, bfsDist } from './deliberation.js';
+import { go_to } from './deliberation.js';
+import { bfsDist, bfsDistDirected } from './utils.js';
 
 /**
  * Go to parcel tile and pick it up.
@@ -55,10 +56,6 @@ async function deliver(agent) {
     return true;
 }
 
-const SPAWN_W_AGENTS   = 0.3;
-const SPAWN_W_RECENCY  = 2;
-const SPAWN_RECENCY_WINDOW_MS = 15000; // tune to server parcel interval
-
 /**
  * Move toward best spawn tile (highest utility score).
  * Records visit timestamp on arrival.
@@ -67,7 +64,7 @@ const SPAWN_RECENCY_WINDOW_MS = 15000; // tune to server parcel interval
  * @returns {Promise<boolean>}
  */
 async function explore(agent, visitedSpawns) {
-    const best = bestSpawnTile(agent, visitedSpawns);
+    const best = nearestSpawnTile(agent, visitedSpawns);
 
     if (!best) {
         console.warn('explore: no reachable spawn tile');
@@ -88,14 +85,14 @@ async function explore(agent, visitedSpawns) {
  * @returns {{ x:number, y:number } | null}
  */
 function nearestDeliveryTile(agent) {
-    const { deliveryTiles, walkable } = agent.beliefs.map;
+    const { deliveryTiles, walkable, exitDirs } = agent.beliefs.map;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
     let best = null, bestDist = Infinity;
     for (const tile of deliveryTiles) {
-        const d = bfsDist(agentPos, tile, walkable);
+        const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
         if (d < bestDist) { bestDist = d; best = tile; }
     }
-    return best;
+    return bestDist < Infinity ? best : null;
 }
 
 /**
@@ -106,24 +103,18 @@ function nearestDeliveryTile(agent) {
  * @param {Map<string, number>} visitedSpawns  key → timestamp of last visit
  * @returns {{ x:number, y:number } | null}
  */
-function bestSpawnTile(agent, visitedSpawns) {
-    const { spawnTiles, walkable } = agent.beliefs.map;
+function nearestSpawnTile(agent, visitedSpawns) {
+    const { spawnTiles, walkable, exitDirs } = agent.beliefs.map;
     if (spawnTiles.length === 0) return null;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
-    const now = Date.now();
-    let best = null, bestScore = -Infinity;
-    for (const tile of spawnTiles) {
-        const dist = bfsDist(agentPos, tile, walkable);
-        if (dist === Infinity) continue;
-        const key = `${tile.x},${tile.y}`;
-        const timeSince = now - (visitedSpawns.get(key) ?? 0);
-        const recencyPenalty = Math.max(0, 1 - timeSince / SPAWN_RECENCY_WINDOW_MS);
-        const score = 1 / (dist + 1)
-                    - SPAWN_W_AGENTS  * (tile.nearbyAgentCount ?? 0)
-                    - SPAWN_W_RECENCY * recencyPenalty;
-        if (score > bestScore) { bestScore = score; best = tile; }
+    const unvisited = spawnTiles.filter(t => !visitedSpawns.has(`${t.x},${t.y}`));
+    const candidates = unvisited.length > 0 ? unvisited : (visitedSpawns.clear(), spawnTiles);
+    let best = null, bestDist = Infinity;
+    for (const tile of candidates) {
+        const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
+        if (d < bestDist) { bestDist = d; best = tile; }
     }
     return best;
 }
 
-export { go_pick_up, deliver, explore, nearestDeliveryTile, bestSpawnTile };
+export { go_pick_up, deliver, explore, nearestDeliveryTile, nearestSpawnTile };
