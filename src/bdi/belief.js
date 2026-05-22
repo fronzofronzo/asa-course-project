@@ -1,4 +1,4 @@
-import { bfsDist } from './utils.js';
+import { bfsDist, computeSpawnHeat} from './utils.js';
 
 const LAMBDA = 0.3;
 

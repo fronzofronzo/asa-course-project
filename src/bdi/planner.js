@@ -130,4 +130,23 @@ function hottestSpawnTile(agent, visitedSpawns) {
     return best;
 }
 
-export { go_pick_up, deliver, explore, nearestDeliveryTile, nearestSpawnTile };
+function computeBestSpawnTile(agent, visitedSpawns) {
+    const { spawnTiles, walkable, exitDirs } = agent.beliefs.map;
+    if (spawnTiles.length === 0) return null;
+    const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
+    const candidates = spawnTiles.filter(t => walkable.has(`${t.x},${t.y}`));
+    let best = null, bestScore = -Infinity;
+    for (const tile of candidates) {
+        const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
+        if (d === Infinity) continue;
+        const distScore = 1 / (d + 1);
+        const agentPenalty = 0.0
+        const recencyPenalty = 0.0
+        const heatScore = agent.beliefs.map.spawnHeat.get(`${tile.x},${tile.y}`) || 0;
+        const score = distScore - agentPenalty - recencyPenalty + heatScore;
+        if (score > bestScore) { bestScore = score; best = tile; }
+    }
+    return best;
+}
+
+export { go_pick_up, deliver, explore, nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile };
