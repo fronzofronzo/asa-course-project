@@ -140,15 +140,15 @@ function computeBestSpawnTile(agent, visitedSpawns) {
     const { spawnTiles, walkable, exitDirs } = agent.beliefs.map;
     if (spawnTiles.length === 0) return null;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
-    const unvisited = spawnTiles.filter(t => !visitedSpawns.has(`${t.x},${t.y}`));
-    const candidates = unvisited.length > 0 ? unvisited : spawnTiles;
+    const candidates = spawnTiles;
     let best = null, bestScore = -Infinity;
     for (const tile of candidates) {
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
         if (d === Infinity) continue;
         const distScore = 1 / (d + 1);
-        const agentPenalty = 0.0
-        const recencyPenalty = 0.0
+        const agentPenalty = [...agent.beliefs.agents.values()].filter(a => Math.abs(a.x - tile.x) + Math.abs(a.y - tile.y) <= 2).length * 0.5;
+        const lastVisit = visitedSpawns.get(`${tile.x},${tile.y}`) || 0;
+        const recencyPenalty = Math.max(0, 1 - (Date.now() - lastVisit) / 10000); // decays over 10s
         const heatScore = agent.beliefs.map.spawnHeat.get(`${tile.x},${tile.y}`) || 0;
         const score = distScore - agentPenalty - recencyPenalty + heatScore;
         if (score > bestScore) { bestScore = score; best = tile; }
