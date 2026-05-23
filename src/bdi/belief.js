@@ -1,4 +1,5 @@
 import { bfsDist, computeSpawnHeat} from './utils.js';
+import { writeFileSync } from 'fs';
 
 const LAMBDA = 0.3;
 
@@ -179,7 +180,18 @@ updateMap(width, height, tiles) {
         if (dir) this.map.exitDirs.set(key, new Set([dir]));
     }
     console.log("Queste sono le spawn tiles", this.map.spawnTiles)
+    this._logHeatMap();
 }
+
+_logHeatMap() {
+        const lines = [];
+        for (const [key, heat] of this.map.spawnHeat) {
+            lines.push(`Cell {${key}} -> ${heat.toFixed(4)}`);
+        }
+        const output = lines.join('\n');
+        console.log(output);
+        writeFileSync('heatmap.txt', output + '\n', 'utf8');
+    }
 }
 
 BeliefSet.PARCEL_TTL_MS = 5000;

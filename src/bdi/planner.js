@@ -73,7 +73,13 @@ async function explore(agent, visitedSpawns) {
 
     const arrived = await go_to({ x: best.x, y: best.y }, agent);
     if (arrived) {
-        visitedSpawns.set(`${best.x},${best.y}`, Date.now());
+        const now = Date.now();
+        visitedSpawns.set(`${best.x},${best.y}`, now);
+        for (const t of agent.beliefs.map.spawnTiles) {
+            if(Math.abs(t.x - best.x) + Math.abs(t.y - best.y) <= 2 ) {
+                visitedSpawns.set(`${t.x},${t.y}`, now);
+            }
+        }
         console.log(`Explored spawn tile (${best.x},${best.y})`);
     }
     return arrived;
@@ -134,7 +140,8 @@ function computeBestSpawnTile(agent, visitedSpawns) {
     const { spawnTiles, walkable, exitDirs } = agent.beliefs.map;
     if (spawnTiles.length === 0) return null;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
-    const candidates = spawnTiles.filter(t => walkable.has(`${t.x},${t.y}`));
+    const unvisited = spawnTiles.filter(t => !visitedSpawns.has(`${t.x},${t.y}`));
+    const candidates = unvisited.length > 0 ? unvisited : spawnTiles;
     let best = null, bestScore = -Infinity;
     for (const tile of candidates) {
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
