@@ -90,11 +90,12 @@ async function explore(agent, visitedSpawns) {
  * @param {object} agent
  * @returns {{ x:number, y:number } | null}
  */
-function nearestDeliveryTile(agent) {
+function nearestDeliveryTile(agent, unreachableDeliveryTiles) {
     const { deliveryTiles, walkable, exitDirs } = agent.beliefs.map;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
+    const reachable = deliveryTiles.filter(t => !unreachableDeliveryTiles.has(`${t.x},${t.y}`));
     let best = null, bestDist = Infinity;
-    for (const tile of deliveryTiles) {
+    for (const tile of reachable) {
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
         if (d < bestDist) { bestDist = d; best = tile; }
     }
@@ -151,6 +152,7 @@ function computeBestSpawnTile(agent, visitedSpawns) {
         const recencyPenalty = Math.max(0, 1 - (Date.now() - lastVisit) / 10000); // decays over 10s
         const heatScore = agent.beliefs.map.spawnHeat.get(`${tile.x},${tile.y}`) || 0;
         const score = distScore - agentPenalty - recencyPenalty + heatScore;
+        console.log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, agentPenalty=${agentPenalty.toFixed(3)}, recencyPenalty=${recencyPenalty.toFixed(3)}, heatScore=${heatScore.toFixed(3)})`);
         if (score > bestScore) { bestScore = score; best = tile; }
     }
     return best;

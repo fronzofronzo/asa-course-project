@@ -78,6 +78,7 @@ agent.socket.onSensing(({ agents, parcels }) => {
 });
 
 const visitedSpawns = new Map(); // key → timestamp of last visit
+const unreachableDeliveryTiles = new Set(); // key of delivery tiles found to be unreachable
 
 async function agentLoop() {
     console.log('Agent loop started — executing continuously with periodic deliberation...');
@@ -133,13 +134,20 @@ async function agentLoop() {
             if (onDelivery) {
                 const dropped = await agent.socket.emitPutdown();
                 console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                unreachableDeliveryTiles.clear(); // clear unreachable set on successful delivery
+                agent.stuckCount = 0;
             } else {
-                const target = nearestDeliveryTile(agent);
+                const target = nearestDeliveryTile(agent, unreachableDeliveryTiles);
                 if (target) {
                     console.log(`[EXECUTE] Moving to delivery (${target.x},${target.y})`);
                     const status = await stepToward(target, agent);
                     console.log(`[EXECUTE] Move result: ${status} now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     if (status === 'stuck') agent.stuckCount++;
+                    if (agent.stuckCount > 5) {
+                        console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach delivery at (${target.x},${target.y}) - marking as unreachable`);
+                        unreachableDeliveryTiles.add(`${target.x},${target.y}`);
+                        agent.stuckCount = 0;
+                    }
                 } else {
                     console.warn('[EXECUTE] ✗ No reachable delivery tile');
                 }
