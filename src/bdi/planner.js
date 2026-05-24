@@ -1,5 +1,6 @@
 import { go_to } from './deliberation.js';
 import { bfsDist, bfsDistDirected } from './utils.js';
+import { log } from './logger.js';
 
 /**
  * Go to parcel tile and pick it up.
@@ -152,7 +153,7 @@ function computeBestSpawnTile(agent, visitedSpawns) {
         const recencyPenalty = Math.max(0, 1 - (Date.now() - lastVisit) / 10000); // decays over 10s
         const heatScore = agent.beliefs.map.spawnHeat.get(`${tile.x},${tile.y}`) || 0;
         const score = distScore - agentPenalty - recencyPenalty + heatScore;
-        console.log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, agentPenalty=${agentPenalty.toFixed(3)}, recencyPenalty=${recencyPenalty.toFixed(3)}, heatScore=${heatScore.toFixed(3)})`);
+        log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, agentPenalty=${agentPenalty.toFixed(3)}, recencyPenalty=${recencyPenalty.toFixed(3)}, heatScore=${heatScore.toFixed(3)}), lastVisit=${lastVisit ? new Date(lastVisit).toISOString() : 'never'}, nearbyAgents=${agentPenalty / 0.5}`);
         if (score > bestScore) { bestScore = score; best = tile; }
     }
     return best;
