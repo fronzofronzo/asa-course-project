@@ -66,13 +66,17 @@ function bfsDistDirected(from, to, walkable, exitDirs) {
 }
 
 function computeSpawnHeat(tile, tiles, radius) {
-    let heat = 0;
-    console.log(tiles)
+    console.log(`Computing heat for spawn tile (${tile.x},${tile.y}) with radius ${radius}`);
+    let heat = 0.0;
     for (const t of tiles) {
-        if (t.type !== 1) continue; // only consider other spawn tiles
-        const dist = Math.hypot(t.x - tile.x, t.y - tile.y);
-        if (dist <= radius) {
-            heat += 1 / (1 + dist);
+        
+        if (t.type == 1) // only consider other spawn tiles
+        {
+            // console.log(`Checking tile (${t.x},${t.y}) of type ${t.type}`);
+            const dist = Math.hypot(t.x - tile.x, t.y - tile.y);
+            if (dist <= radius) {
+                heat += 1 / (1 + dist);
+            }
         }
     }
     return heat;
