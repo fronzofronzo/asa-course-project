@@ -194,7 +194,16 @@ async function agentLoop() {
                 console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
                 const status = await stepToward(target, agent);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                if (status === 'arrived') visitedSpawns.set(`${target.x},${target.y}`, Date.now());
+                if (status === 'arrived') {
+                    const now = Date.now();
+                    visitedSpawns.set(`${target.x},${target.y}`, now);
+                    for (const t of agent.beliefs.map.spawnTiles) {
+                        if(Math.abs(t.x - target.x) + Math.abs(t.y - target.y) <= 2 ) {
+                            visitedSpawns.set(`${t.x},${t.y}`, now);
+                        }
+                    }
+                    console.log(`Explored spawn tile (${target.x},${target.y})`);
+                }
                 if (status === 'stuck') {
                     console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);
                     agent.stuckCount++;
