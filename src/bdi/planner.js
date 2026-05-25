@@ -2,6 +2,8 @@ import { go_to } from './deliberation.js';
 import { bfsDist, bfsDistDirected } from './utils.js';
 import { log } from './logger.js';
 
+const UNREACHABLE_TIMEOUT_MS = 10000; // if delivery tile unreachable for this long, consider it blocked
+
 /**
  * Go to parcel tile and pick it up.
  * Returns true if picked up, false if parcel gone or unreachable.
@@ -94,13 +96,15 @@ async function explore(agent, visitedSpawns) {
 function nearestDeliveryTile(agent, unreachableDeliveryTiles) {
     const { deliveryTiles, walkable, exitDirs } = agent.beliefs.map;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
-    const reachable = deliveryTiles.filter(t => !unreachableDeliveryTiles.has(`${t.x},${t.y}`));
-    let best = null, bestDist = Infinity;
-    for (const tile of reachable) {
+    let best = null, bestScore = Infinity;
+    for (const tile of deliveryTiles) {
+        const elapsed = Date.now() - (unreachableDeliveryTiles.get(`${tile.x},${tile.y}`) || 0);
+        const unreachablePenalty = Math.max(0, 1 - elapsed / UNREACHABLE_TIMEOUT_MS);
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
-        if (d < bestDist) { bestDist = d; best = tile; }
+        const score = d + unreachablePenalty * 1000; // add large penalty to unreachable tiles, decaying over time
+        if (score < bestScore) { bestScore = score; best = tile; }
     }
-    return bestDist < Infinity ? best : null;
+    return bestScore < Infinity ? best : null;
 }
 
 /**
