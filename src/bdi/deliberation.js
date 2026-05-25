@@ -47,9 +47,15 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
     // effectiveReward: expected value = gameReward * P(parcel still exists)
     const effectiveReward = gameReward * (parcel.beliefScore ?? 1.0);
 
+    const stepsToDeliveryNow = carriedCount > 0
+      ? distToNearestDelivery(agentPos, deliveryTiles, walkable)
+      : 0;
+
+    const detoursSteps = stepsToParcel + stepsToDelivery - stepsToDeliveryNow;
+
     return effectiveReward
-        - decay * stepsToParcel
-        - decay * stepsToDelivery;
+        - decay * (stepsToParcel + stepsToDelivery)
+        - decay * carriedCount * detoursSteps;
 }
 
 /**

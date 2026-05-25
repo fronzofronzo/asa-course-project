@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import { BeliefSet } from './belief.js';
-import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
+import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } from './deliberation.js';
 import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 
@@ -124,7 +124,7 @@ async function agentLoop() {
         // --- execution (continuous, one step per iteration) ---
         // Deliver only when deliberation found no parcel worth pursuing.
         // DELIVERY_URGENCY applies inside utility: high carriedReward makes picking up detours less attractive.
-        const shouldDeliver = carriedCount > 0 && agent.intention === null;
+        const shouldDeliver = carriedCount > 0 && (agent.intention === null)
 
         if (shouldDeliver) {
             console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
