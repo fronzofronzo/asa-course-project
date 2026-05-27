@@ -1,6 +1,25 @@
 import "dotenv/config";
+import fs from 'fs';
+import path from 'path';
 import OpenAI from "openai";
 import { missionState, hasMission, getMissionSnapshot, resetMissionState } from './mission-state.js';
+
+// ─── LLM File Logger ──────────────────────────────────────────────────────────
+
+const LLM_LOG_FILE = path.resolve('./logs/llm.log');
+
+function llmLog(level, message) {
+    const timestamp = new Date().toISOString();
+    const entry = `[${timestamp}] [${level}] ${message}\n`;
+    try {
+        fs.appendFileSync(LLM_LOG_FILE, entry, 'utf8');
+    } catch {
+        // logs dir may not exist yet — create and retry
+        fs.mkdirSync(path.dirname(LLM_LOG_FILE), { recursive: true });
+        fs.appendFileSync(LLM_LOG_FILE, entry, 'utf8');
+    }
+    console.log(`[LLM] [${level}] ${message}`);
+}
 
 // LiteLLM configuration
 const baseURL = process.env.LITELLM_BASE_URL || "https://llm.bears.disi.unittn.it/v1";
@@ -118,55 +137,64 @@ function getDeliveryTiles() {
     return JSON.stringify(withDist);
 }
 
-// ─── L2 Mission Tools ─────────────────────────────────────────────────────────
+// ─── Mission Write Tool ───────────────────────────────────────────────────────
 
-function setStackRequirement(input) {
-    const n = parseInt(input);
-    if (isNaN(n) || n < 1) return "Error: input must be a positive integer (e.g. 3).";
-    missionState.stackSize = n;
-    return `Stack requirement set: BDI will deliver only when carrying >= ${n} parcels.`;
-}
-
-function setPreferredDeliveryTiles(input) {
+function commitMission(input) {
     try {
-        const { tiles, multiplier } = JSON.parse(input);
-        if (!Array.isArray(tiles) || tiles.length === 0) {
-            return 'Error: tiles must be a non-empty array, e.g. {"tiles":[{"x":1,"y":2}],"multiplier":5}';
+        const update = JSON.parse(input);
+        const { type } = update;
+
+        if (type === 'stack') {
+            const n = parseInt(update.stackSize ?? update.n);
+            if (isNaN(n) || n < 1) return 'Error: stackSize must be a positive integer.';
+            missionState.stackSize = n;
+            missionState.stackExact = update.stackExact ?? false;
+            const mode = missionState.stackExact ? `exactly ${n}` : `>= ${n}`;
+            return `Beliefs updated: deliver ${mode} parcels.`;
+
+        } else if (type === 'visit') {
+            const map = _getMap();
+            if (map.width === null) return 'Error: map not loaded yet — retry in a moment.';
+            const tiles = (update.visitTargets ?? []).map(t => ({ x: Math.round(t.x), y: Math.round(t.y) }));
+            const walkable = tiles.filter(t => map.walkable.has(`${t.x},${t.y}`));
+            if (walkable.length === 0) return `Error: none of ${JSON.stringify(tiles)} are walkable on this map.`;
+            missionState.visitTargets = walkable;
+            missionState.visitBonus = update.visitBonus ?? 1000;
+            missionState.visitConsumed = false;
+            return `Beliefs updated: visit targets ${JSON.stringify(walkable)} (bonus=${missionState.visitBonus}).`;
+
+        } else if (type === 'preferred_delivery') {
+            const map = _getMap();
+            if (map.width === null) return 'Error: map not loaded yet — retry in a moment.';
+            const deliveryKeys = new Set(map.deliveryTiles.map(t => `${t.x},${t.y}`));
+            const tiles = (update.tiles ?? []).map(t => ({ x: Math.round(t.x), y: Math.round(t.y) }));
+            const valid = tiles.filter(t => deliveryKeys.has(`${t.x},${t.y}`));
+            if (valid.length === 0) return `Error: none of ${JSON.stringify(tiles)} are delivery tiles. Available: ${JSON.stringify(map.deliveryTiles)}`;
+            missionState.preferredDeliveryTiles = valid;
+            missionState.preferredDeliveryMultiplier = update.multiplier ?? 1;
+            return `Beliefs updated: preferred delivery tiles ${JSON.stringify(valid)} (multiplier: ${missionState.preferredDeliveryMultiplier}x).`;
+
+        } else if (type === 'blacklist_tile') {
+            const key = `${Math.round(update.x)},${Math.round(update.y)}`;
+            missionState.blacklistedDeliveryTiles.add(key);
+            return `Beliefs updated: delivery tile (${update.x},${update.y}) blacklisted.`;
+
+        } else if (type === 'reward_cap') {
+            const cap = parseFloat(update.cap);
+            if (isNaN(cap) || cap <= 0) return 'Error: cap must be a positive number.';
+            missionState.rewardCap = cap;
+            return `Beliefs updated: reward cap set to ${cap}.`;
+
+        } else if (type === 'forbidden_tile') {
+            const key = `${Math.round(update.x)},${Math.round(update.y)}`;
+            missionState.forbiddenTiles.add(key);
+            return `Beliefs updated: tile (${update.x},${update.y}) forbidden for routing.`;
+
+        } else {
+            return `Error: unknown type '${type}'. Valid: stack, visit, preferred_delivery, blacklist_tile, reward_cap, forbidden_tile`;
         }
-        missionState.preferredDeliveryTiles = tiles.map(t => ({ x: Math.round(t.x), y: Math.round(t.y) }));
-        missionState.preferredDeliveryMultiplier = multiplier ?? 1;
-        return `Preferred delivery tiles set: ${JSON.stringify(missionState.preferredDeliveryTiles)} (multiplier: ${missionState.preferredDeliveryMultiplier}x). BDI will only deliver at these tiles.`;
-    } catch {
-        return 'Error: expected JSON like {"tiles":[{"x":1,"y":2}],"multiplier":5}';
-    }
-}
-
-function blacklistDeliveryTile(input) {
-    try {
-        const { x, y } = JSON.parse(input);
-        const key = `${Math.round(x)},${Math.round(y)}`;
-        missionState.blacklistedDeliveryTiles.add(key);
-        return `Tile (${Math.round(x)},${Math.round(y)}) blacklisted. BDI will not deliver there.`;
-    } catch {
-        return 'Error: expected JSON like {"x":1,"y":2}';
-    }
-}
-
-function setRewardCap(input) {
-    const cap = parseFloat(input);
-    if (isNaN(cap) || cap <= 0) return "Error: input must be a positive number.";
-    missionState.rewardCap = cap;
-    return `Reward cap set to ${cap}. BDI will skip parcels with reward > ${cap}.`;
-}
-
-function addForbiddenTile(input) {
-    try {
-        const { x, y } = JSON.parse(input);
-        const key = `${Math.round(x)},${Math.round(y)}`;
-        missionState.forbiddenTiles.add(key);
-        return `Tile (${Math.round(x)},${Math.round(y)}) added to forbidden tiles. BDI will route around it.`;
-    } catch {
-        return 'Error: expected JSON like {"x":4,"y":7}';
+    } catch (e) {
+        return `Error: ${e.message}`;
     }
 }
 
@@ -228,8 +256,31 @@ function evaluateMission(input) {
             guadagnoStandard = costoDetour;
             ev = guadagnoMissione - guadagnoStandard;
 
+        } else if (type === "visit_tile") {
+            // One-time visit bonus: EV = bonus - opportunity_cost_of_travel
+            const bonus = params.bonus ?? 1000;
+            const tiles = params.tiles ?? [];
+            const me = _getMe();
+            let minDist = params.distance ?? 20;
+            if (tiles.length > 0 && me.x !== null) {
+                minDist = Math.min(...tiles.map(t => Math.abs(t.x - me.x) + Math.abs(t.y - me.y)));
+            }
+            guadagnoMissione = bonus;
+            guadagnoStandard = pps * minDist;
+            ev = guadagnoMissione - guadagnoStandard;
+
+        } else if (type === "flat_bonus") {
+            // Flat additive bonus per delivery: EV = bonus - opportunity_cost_of_constraint
+            // For stack_exact(N): cost = waiting extra time (avg (N-1) collect cycles) vs delivering immediately
+            const pts = params.pts ?? 500;
+            const n = params.n ?? 3;
+            const extraWait = (n - 1) * avgCollect;
+            guadagnoMissione = pts;
+            guadagnoStandard = pps * extraWait;
+            ev = guadagnoMissione - guadagnoStandard;
+
         } else {
-            return `Error: unknown type '${type}'. Valid: stack, preferred_tile, blacklist, reward_cap, forbidden_tile`;
+            return `Error: unknown type '${type}'. Valid: stack, preferred_tile, blacklist, reward_cap, forbidden_tile, visit_tile, flat_bonus`;
         }
 
         const evRounded = isFinite(ev) ? parseFloat(ev.toFixed(2)) : -999;
@@ -252,20 +303,13 @@ function evaluateMission(input) {
 // ─── Tool Registry ────────────────────────────────────────────────────────────
 
 const TOOLS = {
-    calculate,
-    get_current_time: getCurrentTime,
+    evaluate_mission: evaluateMission,
+    commit_mission: commitMission,
     get_my_position: getMyPosition,
     get_world_state: getWorldState,
-    get_parcels: getParcels,
-    get_delivery_tiles: getDeliveryTiles,
-    evaluate_mission: evaluateMission,
-    set_stack_requirement: setStackRequirement,
-    set_preferred_delivery_tiles: setPreferredDeliveryTiles,
-    blacklist_delivery_tile: blacklistDeliveryTile,
-    set_reward_cap: setRewardCap,
-    add_forbidden_tile: addForbiddenTile,
     get_mission_state: getMissionStateStr,
     reset_mission: resetMission,
+    calculate,
 };
 
 // ─── LLM Helpers ─────────────────────────────────────────────────────────────
@@ -303,62 +347,67 @@ function countActions(text) {
 // ─── Agent Prompt ─────────────────────────────────────────────────────────────
 
 const AGENT_PROMPT = `
-You are the mission-evaluation module of a DeliverooJS BDI agent.
-Your ONLY role: receive mission messages, evaluate their expected value (EV), and configure constraints.
-You do NOT move the agent. The BDI loop handles all movement and execution automatically.
+You are the belief-revision module of a DeliverooJS BDI agent.
+Role: evaluate incoming missions and write accepted missions to agent beliefs.
+You do NOT control movement. The BDI deliberation loop reads beliefs and acts autonomously.
 
-== INFORMATION TOOLS ==
-- calculate(expression): evaluate math expressions
-- get_current_time(location): current time in Rome
-- get_my_position(): current position and score
-- get_world_state(): position, carried parcels, nearby agents, active mission
-- get_parcels(): visible free parcels filtered by reward cap if active
-- get_delivery_tiles(): all delivery tiles with distance, blacklist status, preferred status
+== FLOW (2–3 steps maximum) ==
+Step 1: call evaluate_mission to compute EV
+Step 2a: EV > 0  → call commit_mission → Final Answer "Mission accepted: <brief description>"
+Step 2b: EV <= 0 → Final Answer "Mission rejected: EV = <X> — <reason>"
+If commit_mission returns Error: → Final Answer "Mission rejected: <error>"
 
-== MISSION TOOLS ==
-- evaluate_mission({"type": "...", ...}): compute EV before accepting. ALWAYS call this first.
-  Types and required params:
-    {"type":"stack", "n":3, "multiplier":2}
+== READ TOOLS ==
+- evaluate_mission({"type":"...", ...}): compute expected value. ALWAYS call first.
+  Types:
+    {"type":"stack",          "n":3,   "multiplier":1}        — benefit of delivering >= N parcels
+    {"type":"flat_bonus",     "pts":500, "n":3}               — flat bonus for delivering exactly N
+    {"type":"visit_tile",     "bonus":1000, "tiles":[...]}    — one-time tile visit bonus
     {"type":"preferred_tile", "multiplier":5, "extra_steps":4}
     {"type":"blacklist"}
-    {"type":"reward_cap", "cap":10}
+    {"type":"reward_cap",     "cap":10}
     {"type":"forbidden_tile", "extra_steps":3, "penalty":50, "prob_enter":0.2}
 
-- set_stack_requirement(N): BDI delivers only when carrying >= N parcels
-- set_preferred_delivery_tiles({"tiles":[{"x":1,"y":2}], "multiplier":5}): BDI only delivers at these tiles
-- blacklist_delivery_tile({"x":1,"y":2}): BDI never delivers at this tile
-- set_reward_cap(cap): BDI skips parcels with reward above this value
-- add_forbidden_tile({"x":4,"y":7}): BDI routes around this tile in navigation
-- get_mission_state(): show all active constraints
-- reset_mission(): clear all constraints
+- get_my_position(): agent current position and score
+- get_world_state(): carried parcels, nearby agents, active mission snapshot
 
-== MISSION HANDLING RULES ==
-When [MISSION RECEIVED from X]: "message text"
-1. Call evaluate_mission FIRST with appropriate type and params
-2. If EV > 0: accept — call the appropriate setup tool(s), then Final Answer "Mission accepted"
-3. If EV <= 0 or blacklist: reject — Final Answer "Mission rejected, EV = X"
-4. A blacklist mission always has EV = -Infinity — always reject
-5. After set_preferred_delivery_tiles: call get_delivery_tiles to verify tiles exist on map.
-   If none have "preferred": true — call reset_mission, Final Answer "Mission rejected: preferred tiles not on map"
+== WRITE TOOL ==
+- commit_mission({"type":"...", ...}): atomically write mission to agent beliefs. Call ONCE after EV > 0.
+  Types:
+    {"type":"stack",              "stackSize":3, "stackExact":false}
+    {"type":"stack",              "stackSize":3, "stackExact":true}   ← for "exactly N"
+    {"type":"visit",              "visitTargets":[{"x":11,"y":12},{"x":12,"y":12}], "visitBonus":1000}
+    {"type":"preferred_delivery", "tiles":[{"x":2,"y":18}], "multiplier":5}
+    {"type":"blacklist_tile",     "x":2, "y":18}
+    {"type":"reward_cap",         "cap":10}
+    {"type":"forbidden_tile",     "x":4, "y":7}
+  Returns "Beliefs updated: ..." on success, "Error: ..." on failure (then reject mission).
+
+- reset_mission(): clear all active mission constraints
+- get_mission_state(): inspect current belief state
+- calculate(expression): math helper
+
+== MISSION TYPE SELECTION ==
+"deliver exactly N parcels"   → evaluate: flat_bonus {pts, n}       → commit: stack {stackSize:N, stackExact:true}
+"deliver N or more parcels"   → evaluate: stack {n, multiplier}     → commit: stack {stackSize:N, stackExact:false}
+"go to / visit coordinates"   → evaluate: visit_tile {bonus, tiles} → commit: visit {visitTargets, visitBonus}
+"deliver at tile X,Y"         → evaluate: preferred_tile            → commit: preferred_delivery {tiles, multiplier}
+"avoid / blacklist tile"       → evaluate: blacklist                 → commit: blacklist_tile {x, y}
+"skip parcels above reward X" → evaluate: reward_cap                → commit: reward_cap {cap}
+"route around tile"           → evaluate: forbidden_tile            → commit: forbidden_tile {x, y}
 
 == OUTPUT FORMAT — choose exactly one ==
 
 FORMAT 1 — use a tool:
 Thought: <brief reasoning>
 Action: <tool name>
-Action Input: <tool input, or omit this line for no-arg tools>
+Action Input: <tool input>
 
 FORMAT 2 — final answer:
-Thought: I have enough information to answer.
+Thought: I have all the information needed.
 Final Answer: <answer>
 
-Rules:
-- Output exactly one action at a time.
-- Never output two actions in the same message.
-- Never output Action and Final Answer together.
-- Never write Action: None.
-- Do not invent tool results.
-- Only give Final Answer when all required tool calls have been observed.
+Rules: one action per message, never Action and Final Answer together, never invent tool results.
 `.trim();
 
 // ─── Conversation Memory ──────────────────────────────────────────────────────
@@ -368,6 +417,7 @@ const messages = [{ role: "system", content: AGENT_PROMPT }];
 // ─── Agent Loop ───────────────────────────────────────────────────────────────
 
 async function runAgentTurn(userInput, maxIterations = 12) {
+    llmLog('TURN_START', `input="${userInput.substring(0, 200)}"`);
     const turnMessages = [
         { role: "system", content: AGENT_PROMPT },
         ...messages.slice(1),
@@ -375,18 +425,18 @@ async function runAgentTurn(userInput, maxIterations = 12) {
     ];
 
     for (let i = 0; i < maxIterations; i++) {
-        console.log(`--- LLM iteration ${i + 1} ---`);
+        llmLog('ITER', `iteration=${i + 1}/${maxIterations}`);
 
         const assistantMessage = await callModel(turnMessages, { temperature: 0 });
-        console.log(`[LLM output]:\n${assistantMessage}\n`);
+        llmLog('OUTPUT', `\n${assistantMessage}`);
 
         turnMessages.push({ role: "assistant", content: assistantMessage });
 
         if (countActions(assistantMessage) > 1) {
-            console.log(`[Warning: multiple actions in one message — executing only first]`);
+            llmLog('WARN', 'Multiple actions in one message — executing only first');
         }
         if (hasBothActionAndFinalAnswer(assistantMessage)) {
-            console.log("[Warning: Action and Final Answer together — executing Action first]");
+            llmLog('WARN', 'Action and Final Answer together — executing Action first');
         }
 
         const parsedAction = extractAction(assistantMessage);
@@ -396,13 +446,13 @@ async function runAgentTurn(userInput, maxIterations = 12) {
             let observation;
 
             if (TOOLS[action]) {
-                console.log(`[LLM tool: ${action}("${actionInput}")]`);
+                llmLog('TOOL', `${action}(${actionInput})`);
                 observation = await TOOLS[action](actionInput);
             } else {
                 observation = `Error: unknown tool '${action}'. Available: ${Object.keys(TOOLS).join(", ")}`;
             }
 
-            console.log(`[Observation: ${observation}]\n`);
+            llmLog('OBS', observation);
             turnMessages.push({
                 role: "user",
                 content:
@@ -418,18 +468,19 @@ async function runAgentTurn(userInput, maxIterations = 12) {
         const finalAnswer = extractFinalAnswer(assistantMessage);
 
         if (finalAnswer) {
-            console.log(`[LLM Final Answer]: ${finalAnswer}\n`);
+            llmLog('ANSWER', finalAnswer);
             messages.push({ role: "user", content: userInput });
             messages.push({ role: "assistant", content: finalAnswer });
             return finalAnswer;
         }
 
         const observation = "Error: invalid format. Output either one Action or one Final Answer.";
+        llmLog('WARN', `Invalid format at iteration ${i + 1} — injecting correction`);
         turnMessages.push({ role: "user", content: `Observation: ${observation}` });
     }
 
     const fallback = "Could not complete within maximum iterations.";
-    console.log(`[LLM]: ${fallback}\n`);
+    llmLog('WARN', `Max iterations (${maxIterations}) reached for input: "${userInput.substring(0, 120)}"`);
     messages.push({ role: "user", content: userInput });
     messages.push({ role: "assistant", content: fallback });
     return fallback;
@@ -467,7 +518,7 @@ async function drainMissions() {
  */
 export function initLLMModule(socket, getMe, getWorld, getMap) {
     if (!client) {
-        console.warn('[LLM Module] No LITELLM_API_KEY — module loaded but LLM calls will fail');
+        llmLog('WARN', 'No LITELLM_API_KEY — module loaded but LLM calls will fail');
     }
 
     _getMe = getMe;
@@ -487,10 +538,10 @@ export function initLLMModule(socket, getMe, getWorld, getMap) {
     socket.onMsg(async (id, name, msg, reply) => {
         const adminId = process.env.ADMIN_ID;
         if (adminId && id !== adminId) {
-            console.log(`[LLM Module] Ignoring message from ${name} (not admin)`);
+            llmLog('INFO', `Ignoring message from ${name} (id=${id}) — not admin`);
             return;
         }
-        console.log(`\n[MISSION] Message from ${name}: ${msg}`);
+        llmLog('MISSION', `from=${name} id=${id} msg="${msg}"`);
         if (reply) {
             const agentName = _getMe().name ?? 'BDI+LLM agent';
             try { reply(`${agentName} received your message, evaluating...`); } catch {}
@@ -499,5 +550,5 @@ export function initLLMModule(socket, getMe, getWorld, getMap) {
         if (!busy) await drainMissions();
     });
 
-    console.log('[LLM Module] Initialized and listening for mission messages');
+    llmLog('INFO', 'LLM module initialized — listening for mission messages');
 }

@@ -136,8 +136,11 @@ async function agentLoop() {
 
         // --- execution (continuous, one step per iteration) ---
         // Deliver only when deliberation found no parcel worth pursuing.
-        // stackSize mission: wait until carrying enough parcels before delivering.
-        const stackSatisfied = missionState.stackSize === null || carriedCount >= missionState.stackSize;
+        // stackSize mission: wait until carrying the required number of parcels before delivering.
+        const stackSatisfied = missionState.stackSize === null
+            || (missionState.stackExact
+                ? carriedCount === missionState.stackSize
+                : carriedCount >= missionState.stackSize);
         const shouldDeliver = carriedCount > 0 && agent.intention === null && stackSatisfied;
 
         if (shouldDeliver) {
@@ -208,33 +211,47 @@ async function agentLoop() {
 
         } else {
             console.log(`[EXECUTE] EXPLORATION PHASE`);
-            const target = computeBestSpawnTile(agent, visitedSpawns);
+            const target = computeBestSpawnTile(agent, visitedSpawns, missionState);
             if (target) {
+                const isVisitTarget = target._visitTarget === true;
+                const label = isVisitTarget ? 'visit target' : 'spawn tile';
                 const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
-                console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
+                console.log(`[EXECUTE] Moving to ${label} (${target.x},${target.y}) (${dist} steps away)`);
                 const status = await stepToward(target, agent, missionState.forbiddenTiles);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'arrived') {
-                    const now = Date.now();
-                    visitedSpawns.set(`${target.x},${target.y}`, now);
-                    for (const t of agent.beliefs.map.spawnTiles) {
-                        if(Math.abs(t.x - target.x) + Math.abs(t.y - target.y) <= 2 ) {
-                            visitedSpawns.set(`${t.x},${t.y}`, now);
+                    if (isVisitTarget) {
+                        console.log(`[EXECUTE] ✓ Arrived at visit target (${target.x},${target.y}) — mission complete`);
+                        missionState.visitConsumed = true;
+                        missionState.visitTargets = null;
+                    } else {
+                        const now = Date.now();
+                        visitedSpawns.set(`${target.x},${target.y}`, now);
+                        for (const t of agent.beliefs.map.spawnTiles) {
+                            if (Math.abs(t.x - target.x) + Math.abs(t.y - target.y) <= 2) {
+                                visitedSpawns.set(`${t.x},${t.y}`, now);
+                            }
                         }
+                        console.log(`Explored spawn tile (${target.x},${target.y})`);
                     }
-                    console.log(`Explored spawn tile (${target.x},${target.y})`);
                 }
                 if (status === 'stuck') {
-                    console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);
+                    console.warn(`[STUCK] Cannot reach ${label} (${target.x},${target.y})`);
                     agent.stuckCount++;
                     if (agent.stuckCount > 5) {
-                        console.warn(`[STUCK] stuckCount=${agent.stuckCount} > 5, marking spawn (${target.x},${target.y}) as visited`);
-                        visitedSpawns.set(`${target.x},${target.y}`, Date.now());
+                        if (isVisitTarget) {
+                            console.warn(`[STUCK] Aborting unreachable visit target (${target.x},${target.y})`);
+                            missionState.visitConsumed = true;
+                            missionState.visitTargets = null;
+                        } else {
+                            console.warn(`[STUCK] Marking spawn (${target.x},${target.y}) as visited`);
+                            visitedSpawns.set(`${target.x},${target.y}`, Date.now());
+                        }
                         agent.stuckCount = 0;
                     }
                 }
             } else {
-                console.warn('[EXECUTE] No spawn target found');
+                console.warn('[EXECUTE] No exploration target found');
             }
         }
 

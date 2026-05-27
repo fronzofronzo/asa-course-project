@@ -144,24 +144,36 @@ function hottestSpawnTile(agent, visitedSpawns) {
     return best;
 }
 
-function computeBestSpawnTile(agent, visitedSpawns) {
+function computeBestSpawnTile(agent, visitedSpawns, missionState = null) {
     const { spawnTiles, walkable, exitDirs } = agent.beliefs.map;
-    if (spawnTiles.length === 0) return null;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
-    const candidates = spawnTiles;
     let best = null, bestScore = -Infinity;
-    for (const tile of candidates) {
+
+    // Score spawn tiles with the existing utility formula
+    for (const tile of spawnTiles) {
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
         if (d === Infinity) continue;
         const distScore = 1 / (d + 1);
         const agentPenalty = [...agent.beliefs.agents.values()].filter(a => Math.abs(a.x - tile.x) + Math.abs(a.y - tile.y) <= 2).length * 0.5;
         const lastVisit = visitedSpawns.get(`${tile.x},${tile.y}`) || 0;
-        const recencyPenalty = Math.max(0, 1 - (Date.now() - lastVisit) / 10000); // decays over 10s
+        const recencyPenalty = Math.max(0, 1 - (Date.now() - lastVisit) / 10000);
         const heatScore = agent.beliefs.map.spawnHeat.get(`${tile.x},${tile.y}`) || 0;
         const score = distScore - agentPenalty - recencyPenalty + heatScore;
         log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, agentPenalty=${agentPenalty.toFixed(3)}, recencyPenalty=${recencyPenalty.toFixed(3)}, heatScore=${heatScore.toFixed(3)}), lastVisit=${lastVisit ? new Date(lastVisit).toISOString() : 'never'}, nearbyAgents=${agentPenalty / 0.5}`);
         if (score > bestScore) { bestScore = score; best = tile; }
     }
+
+    // Visit targets: score = bonus - distance (always dominates spawn scores when bonus is large)
+    if (missionState?.visitTargets && !missionState.visitConsumed) {
+        for (const tile of missionState.visitTargets) {
+            const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
+            if (d === Infinity) continue;
+            const score = missionState.visitBonus - d;
+            log(`Visit target (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (bonus=${missionState.visitBonus})`);
+            if (score > bestScore) { bestScore = score; best = { ...tile, _visitTarget: true }; }
+        }
+    }
+
     return best;
 }
 
