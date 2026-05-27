@@ -67,12 +67,13 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
  * @param {number} threshold
  * @returns {{ parcel: object, utility: number }[]}
  */
-function generateOptions(beliefs, agentPos, carriedCount, decay, threshold) {
+function generateOptions(beliefs, agentPos, carriedCount, decay, threshold, missionState = null) {
     const { deliveryTiles, walkable } = beliefs.map;
     const desires = [];
 
     for (const parcel of beliefs.parcels.values()) {
-        if (parcel.carriedBy !== null) continue; // already held by someone
+        if (parcel.carriedBy !== null) continue;
+        if (missionState?.rewardCap !== null && parcel.reward > missionState.rewardCap) continue;
         const utility = computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, beliefs.agents);
         if (utility > threshold) {
             desires.push({ parcel, utility });
@@ -117,7 +118,7 @@ function filterIntentions(desires, currentIntention, epsilon) {
  * @param {Map<string, object>} knownAgents  belief agents (their tiles are avoided)
  * @returns {string[] | null}
  */
-function computePath(from, to, walkable, exitDirs, knownAgents) {
+function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles = new Set()) {
     const sx = Math.round(from.x), sy = Math.round(from.y);
     const gx = to.x, gy = to.y;
     const startKey = `${sx},${sy}`;
@@ -136,6 +137,7 @@ function computePath(from, to, walkable, exitDirs, knownAgents) {
     const blocked = new Set(
         [...knownAgents.values()].map(a => `${Math.round(a.x)},${Math.round(a.y)}`)
     );
+    for (const key of forbiddenTiles) blocked.add(key);
     blocked.delete(startKey);
     if (blocked.size > 0) {
         console.log(`[PATHFIND] ${blocked.size} agent(s) blocking`);
@@ -224,7 +226,7 @@ async function go_to(target, agent) {
  * @param {object} agent
  * @returns {Promise<'arrived'|'moved'|'stuck'>}
  */
-async function stepToward(target, agent) {
+async function stepToward(target, agent, forbiddenTiles = new Set()) {
     const from = { x: agent.x, y: agent.y };
     const to = target;
     
@@ -262,7 +264,8 @@ async function stepToward(target, agent) {
         target,
         agent.beliefs.map.walkable,
         agent.beliefs.map.exitDirs,
-        agent.beliefs.agents
+        agent.beliefs.agents,
+        forbiddenTiles
     );
 
     if (path === null) {

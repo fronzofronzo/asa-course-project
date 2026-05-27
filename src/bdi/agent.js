@@ -3,6 +3,8 @@ import { BeliefSet } from './belief.js';
 import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } from './deliberation.js';
 import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
+import { missionState } from './llm/mission-state.js';
+import { initLLMModule } from './llm/llm_agent.js';
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
@@ -77,6 +79,17 @@ agent.socket.onSensing(({ agents, parcels }) => {
     agent._notifyBeliefChanged();
 });
 
+// Wire LLM module — reads agent/world state, writes to missionState singleton
+initLLMModule(
+    agent.socket,
+    () => ({ id: agent.id, name: agent.name, x: agent.x, y: agent.y, score: agent.score }),
+    () => ({
+        parcels: [...agent.beliefs.parcels.values()],
+        agents: [...agent.beliefs.agents.values()].filter(a => a.id !== agent.id),
+    }),
+    () => agent.beliefs.map,
+);
+
 const visitedSpawns = new Map(); // key → timestamp of last visit
 const unreachableDeliveryTiles = new Map(); // key of delivery tiles found to be unreachable
 
@@ -95,7 +108,7 @@ async function agentLoop() {
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
         // Always compute desires so shouldDeliver has accurate parcel count
-        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
+        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD, missionState);
 
         // --- deliberation (periodic, on belief change, or when intention just cleared) ---
         if (agent.shouldDeliberate() || agent.intention == null) {
@@ -123,23 +136,31 @@ async function agentLoop() {
 
         // --- execution (continuous, one step per iteration) ---
         // Deliver only when deliberation found no parcel worth pursuing.
-        // DELIVERY_URGENCY applies inside utility: high carriedReward makes picking up detours less attractive.
-        const shouldDeliver = carriedCount > 0 && (agent.intention === null)
+        // stackSize mission: wait until carrying enough parcels before delivering.
+        const stackSatisfied = missionState.stackSize === null || carriedCount >= missionState.stackSize;
+        const shouldDeliver = carriedCount > 0 && agent.intention === null && stackSatisfied;
 
         if (shouldDeliver) {
             console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
             const onDelivery = agent.beliefs.map.deliveryTiles
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
-            if (onDelivery) {
+            const curKey = `${Math.round(agent.x)},${Math.round(agent.y)}`;
+            if (onDelivery && !missionState.blacklistedDeliveryTiles.has(curKey)) {
                 const dropped = await agent.socket.emitPutdown();
                 console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 agent.stuckCount = 0;
             } else {
-                const target = nearestDeliveryTile(agent, unreachableDeliveryTiles);
+                if (onDelivery) console.log(`[EXECUTE] On blacklisted delivery tile — seeking another`);
+                const target = nearestDeliveryTile(
+                    agent,
+                    unreachableDeliveryTiles,
+                    missionState.blacklistedDeliveryTiles,
+                    missionState.preferredDeliveryTiles,
+                );
                 if (target) {
                     console.log(`[EXECUTE] Moving to delivery (${target.x},${target.y})`);
-                    const status = await stepToward(target, agent);
+                    const status = await stepToward(target, agent, missionState.forbiddenTiles);
                     console.log(`[EXECUTE] Move result: ${status} now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     if (status === 'stuck') agent.stuckCount++;
                     if (agent.stuckCount > 5) {
@@ -170,7 +191,7 @@ async function agentLoop() {
                 }
             } else {
                 console.log(`[EXECUTE] Moving to parcel ${p.id} at (${p.x},${p.y}) (${Math.round(Math.sqrt((p.x - agent.x) ** 2 + (p.y - agent.y) ** 2))} steps away)`);
-                const status = await stepToward(p, agent);
+                const status = await stepToward(p, agent, missionState.forbiddenTiles);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'stuck') {
                     agent.stuckCount++;
@@ -191,7 +212,7 @@ async function agentLoop() {
             if (target) {
                 const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
                 console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
-                const status = await stepToward(target, agent);
+                const status = await stepToward(target, agent, missionState.forbiddenTiles);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'arrived') {
                     const now = Date.now();

@@ -93,15 +93,17 @@ async function explore(agent, visitedSpawns) {
  * @param {object} agent
  * @returns {{ x:number, y:number } | null}
  */
-function nearestDeliveryTile(agent, unreachableDeliveryTiles) {
+function nearestDeliveryTile(agent, unreachableDeliveryTiles = new Map(), excludeTiles = new Set(), onlyTiles = null) {
     const { deliveryTiles, walkable, exitDirs } = agent.beliefs.map;
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
     let best = null, bestScore = Infinity;
-    for (const tile of deliveryTiles) {
+    const candidates = onlyTiles !== null && onlyTiles.length > 0 ? onlyTiles : deliveryTiles;
+    for (const tile of candidates) {
+        if (excludeTiles.has(`${tile.x},${tile.y}`)) continue;
         const elapsed = Date.now() - (unreachableDeliveryTiles.get(`${tile.x},${tile.y}`) || 0);
         const unreachablePenalty = Math.max(0, 1 - elapsed / UNREACHABLE_TIMEOUT_MS);
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
-        const score = d + unreachablePenalty * 1000; // add large penalty to unreachable tiles, decaying over time
+        const score = d + unreachablePenalty * 1000;
         if (score < bestScore) { bestScore = score; best = tile; }
     }
     return bestScore < Infinity ? best : null;
