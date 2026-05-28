@@ -3,6 +3,7 @@ import { BeliefSet } from './belief.js';
 import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } from './deliberation.js';
 import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
+import { interpretMission } from './llm/mission_interpreter.js';
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
@@ -80,10 +81,36 @@ agent.socket.onSensing(({ agents, parcels }) => {
 const visitedSpawns = new Map(); // key → timestamp of last visit
 const unreachableDeliveryTiles = new Map(); // key of delivery tiles found to be unreachable
 
-setTimeout(() => {
-    agent.beliefs.tileUtilities.set('29,19', 500);  // replace with a real walkable coord
-    console.log('[TEST] Injected GOTO tile (29,19) with utility 500');
-}, 5000); // 5s after start so map/position are ready
+let llmBusy = false;
+const pendingMissions = [];
+
+async function drainMissions() {
+    while (pendingMissions.length > 0 && !llmBusy) {
+        const { name, msg, replyFn } = pendingMissions.shift();
+        llmBusy = true;
+        try {
+            await interpretMission(
+                name, msg, agent.beliefs,
+                () => ({ x: agent.x, y: agent.y, score: agent.score }),
+                replyFn
+            );
+        } finally {
+            llmBusy = false;
+        }
+    }
+}
+
+agent.socket.onMsg(async (senderId, name, msg, ack) => {
+    console.log(`\n[MISSION] Message from ${name}: ${msg}`);
+    // Works for both emitAsk (ack replies to caller) and emitSay (emitSay sends a new message)
+    const replyFn = (message) => {
+        if (ack) try { ack(message); } catch {}
+        agent.socket.emitSay(senderId, message);
+    };
+    if (ack) try { ack(`${agent.name ?? 'agent'} received your message, evaluating...`); } catch {}
+    pendingMissions.push({ name, msg, replyFn });
+    if (!llmBusy) await drainMissions();
+});
 
 async function agentLoop() {
     console.log('Agent loop started — executing continuously with periodic deliberation...');
