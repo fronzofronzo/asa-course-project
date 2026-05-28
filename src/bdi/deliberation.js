@@ -59,24 +59,41 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
 }
 
 /**
- * Generate desires: scored parcel options above threshold, sorted by utility desc.
+ * Generate desires: all options sorted by utility desc.
+ * Emits PICKUP, DELIVER, and GOTO desires.
  * @param {import('./belief.js').BeliefSet} beliefs
  * @param {{ x:number, y:number }} agentPos
  * @param {number} carriedCount
+ * @param {number} carriedReward
  * @param {number} decay
  * @param {number} threshold
- * @returns {{ parcel: object, utility: number }[]}
+ * @returns {{ type: string, id: string, utility: number }[]}
  */
-function generateOptions(beliefs, agentPos, carriedCount, decay, threshold) {
+function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold) {
     const { deliveryTiles, walkable } = beliefs.map;
     const desires = [];
 
+    // PICKUP desires
     for (const parcel of beliefs.parcels.values()) {
-        if (parcel.carriedBy !== null) continue; // already held by someone
+        if (parcel.carriedBy !== null) continue;
         const utility = computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, beliefs.agents);
         if (utility > threshold) {
-            desires.push({ parcel, utility });
+            desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility });
         }
+    }
+
+    // DELIVER desire — only when carrying and no viable pickups visible
+    // (preserves "collect all visible parcels, then deliver" behaviour)
+    if (carriedCount > 0 && desires.length === 0) {
+        const distDel = distToNearestDelivery(agentPos, deliveryTiles, walkable);
+        const utility = carriedReward - decay * distDel;
+        desires.push({ type: 'DELIVER', id: 'DELIVER', utility });
+    }
+
+    // GOTO desires — LLM-injected tile goals
+    for (const [key, utility] of beliefs.tileUtilities) {
+        const [x, y] = key.split(',').map(Number);
+        desires.push({ type: 'GOTO', id: `GOTO:${key}`, tile: { x, y }, utility });
     }
 
     desires.sort((a, b) => b.utility - a.utility);
@@ -99,7 +116,7 @@ function filterIntentions(desires, currentIntention, epsilon) {
     if (currentIntention === null) return best;
 
     // re-check current intention still in desires (parcel may be gone)
-    const currentStillValid = desires.find(d => d.parcel.id === currentIntention.parcel.id);
+    const currentStillValid = desires.find(d => d.id === currentIntention.id);
     if (!currentStillValid) return best;
 
     // only switch if significantly better

@@ -80,6 +80,11 @@ agent.socket.onSensing(({ agents, parcels }) => {
 const visitedSpawns = new Map(); // key → timestamp of last visit
 const unreachableDeliveryTiles = new Map(); // key of delivery tiles found to be unreachable
 
+setTimeout(() => {
+    agent.beliefs.tileUtilities.set('29,19', 500);  // replace with a real walkable coord
+    console.log('[TEST] Injected GOTO tile (29,19) with utility 500');
+}, 5000); // 5s after start so map/position are ready
+
 async function agentLoop() {
     console.log('Agent loop started — executing continuously with periodic deliberation...');
 
@@ -95,38 +100,34 @@ async function agentLoop() {
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
         // Always compute desires so shouldDeliver has accurate parcel count
-        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, DECAY, UTILITY_THRESHOLD);
+        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD);
 
         // --- deliberation (periodic, on belief change, or when intention just cleared) ---
         if (agent.shouldDeliberate() || agent.intention == null) {
             console.log(`\n[DELIBERATION] at (${Math.round(agent.x)},${Math.round(agent.y)}) | carried=${carriedCount} reward=${carriedReward.toFixed(1)}`);
             console.log(`[DELIBERATION] Found ${desires.length} viable parcel(s)`);
             if (desires.length > 0) {
-                console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.parcel.id}@${d.parcel.x},${d.parcel.y} U=${d.utility.toFixed(1)})`).join(' | ')}`);
+                console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.id} type=${d.type} U=${d.utility.toFixed(1)})`).join(' | ')}`);
             }
 
             const newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
 
-            if (newIntention?.parcel.id !== agent.intention?.parcel.id) {
+            if (newIntention?.id !== agent.intention?.id) {
                 agent.intention = newIntention;
                 agent.stuckCount = 0;
                 if (newIntention) {
-                    console.log(`[INTENTION] NEW: parcel ${newIntention.parcel.id} at (${newIntention.parcel.x},${newIntention.parcel.y}) U=${newIntention.utility.toFixed(2)}`);
+                    console.log(`[INTENTION] NEW: id=${newIntention.id} type=${newIntention.type} U=${newIntention.utility.toFixed(2)}`);
                 } else {
-                    console.log('[INTENTION] CLEARED: no viable parcel');
+                    console.log('[INTENTION] CLEARED: no viable desire');
                 }
             } else if (agent.intention) {
-                console.log(`[INTENTION] HELD: parcel ${agent.intention.parcel.id} at (${agent.intention.parcel.x},${agent.intention.parcel.y}) U=${agent.intention.utility.toFixed(2)}`);
+                console.log(`[INTENTION] HELD: id=${agent.intention.id} type=${agent.intention.type} U=${agent.intention.utility.toFixed(2)}`);
             }
             agent.recordDeliberation();
         }
 
         // --- execution (continuous, one step per iteration) ---
-        // Deliver only when deliberation found no parcel worth pursuing.
-        // DELIVERY_URGENCY applies inside utility: high carriedReward makes picking up detours less attractive.
-        const shouldDeliver = carriedCount > 0 && (agent.intention === null)
-
-        if (shouldDeliver) {
+        if (agent.intention?.type === 'DELIVER') {
             console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
             const onDelivery = agent.beliefs.map.deliveryTiles
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
@@ -135,6 +136,7 @@ async function agentLoop() {
                 const dropped = await agent.socket.emitPutdown();
                 console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 agent.stuckCount = 0;
+                agent.intention = null;
             } else {
                 const target = nearestDeliveryTile(agent, unreachableDeliveryTiles);
                 if (target) {
@@ -152,7 +154,7 @@ async function agentLoop() {
                 }
             }
 
-        } else if (agent.intention !== null) {
+        } else if (agent.intention?.type === 'PICKUP') {
             const p = agent.intention.parcel;
             const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
             const onParcel = isStable && agent.x === p.x && agent.y === p.y;
@@ -177,6 +179,35 @@ async function agentLoop() {
                     console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach parcel ${p.id} at (${p.x},${p.y})`);
                     if (agent.stuckCount > 5) {
                         console.warn(`[STUCK] Clearing intention after ${agent.stuckCount} failed moves`);
+                        agent.intention = null;
+                        agent.stuckCount = 0;
+                    }
+                } else {
+                    agent.stuckCount = 0;
+                }
+            }
+
+        } else if (agent.intention?.type === 'GOTO') {
+            const gotoTile = agent.intention.tile;
+            const gotoKey = `${gotoTile.x},${gotoTile.y}`;
+            const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
+            const onTile = isStable && agent.x === gotoTile.x && agent.y === gotoTile.y;
+
+            console.log(`[EXECUTE] GOTO (${gotoTile.x},${gotoTile.y})`);
+            if (onTile) {
+                console.log(`[EXECUTE] ✓ Arrived at GOTO tile (${gotoTile.x},${gotoTile.y}), clearing`);
+                agent.beliefs.tileUtilities.delete(gotoKey);
+                agent.intention = null;
+                agent.stuckCount = 0;
+            } else {
+                const status = await stepToward(gotoTile, agent);
+                console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                if (status === 'stuck') {
+                    agent.stuckCount++;
+                    console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach GOTO tile (${gotoTile.x},${gotoTile.y})`);
+                    if (agent.stuckCount > 5) {
+                        console.warn(`[STUCK] Abandoning GOTO tile (${gotoTile.x},${gotoTile.y}) as unreachable`);
+                        agent.beliefs.tileUtilities.delete(gotoKey);
                         agent.intention = null;
                         agent.stuckCount = 0;
                     }
