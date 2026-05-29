@@ -1,4 +1,4 @@
-import { bfsDist } from './utils.js';
+import { bfsDist, getEffectiveDeliveryTiles } from './utils.js';
 
 /**
  * Nearest delivery tile distance from a given position.
@@ -30,9 +30,11 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
  */
 const BELIEF_THRESHOLD = 0.1;
 
-function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map()) {
+function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map(), constraints = null) {
     // parcel with low belief score is probably gone — skip immediately
     if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
+    // skip parcels exceeding reward cap
+    if (constraints?.rewardCap !== null && constraints?.rewardCap !== undefined && parcel.reward > constraints.rewardCap) return -Infinity;
 
     const stepsToParcel = bfsDist(agentPos, parcel, walkable);
     if (stepsToParcel === Infinity) return -Infinity;
@@ -71,23 +73,34 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
  */
 function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold) {
     const { deliveryTiles, walkable } = beliefs.map;
+    const constraints = beliefs.missionConstraints ?? null;
+    const effectiveDeliveryTiles = getEffectiveDeliveryTiles(deliveryTiles, constraints);
     const desires = [];
 
-    // PICKUP desires
-    for (const parcel of beliefs.parcels.values()) {
-        if (parcel.carriedBy !== null) continue;
-        const utility = computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, beliefs.agents);
-        if (utility > threshold) {
-            desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility });
+    // PICKUP desires — skip entirely if stack.max reached
+    const atStackMax = constraints?.stack?.max !== null && constraints?.stack?.max !== undefined
+        && carriedCount >= constraints.stack.max;
+    if (!atStackMax) {
+        for (const parcel of beliefs.parcels.values()) {
+            if (parcel.carriedBy !== null) continue;
+            const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints);
+            if (utility > threshold) {
+                desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility });
+            }
         }
     }
 
-    // DELIVER desire — only when carrying and no viable pickups visible
-    // (preserves "collect all visible parcels, then deliver" behaviour)
+    // DELIVER desire — only when carrying, no viable pickups visible, and stack constraint satisfied
     if (carriedCount > 0 && desires.length === 0) {
-        const distDel = distToNearestDelivery(agentPos, deliveryTiles, walkable);
-        const utility = carriedReward - decay * distDel;
-        desires.push({ type: 'DELIVER', id: 'DELIVER', utility });
+        const stackMin = constraints?.stack?.min ?? null;
+        const stackReady = stackMin === null || carriedCount >= stackMin;
+        if (stackReady) {
+            const distDel = distToNearestDelivery(agentPos, effectiveDeliveryTiles, walkable);
+            const utility = carriedReward - decay * distDel;
+            desires.push({ type: 'DELIVER', id: 'DELIVER', utility });
+        }
+        // if !stackReady: desires stays empty → agent explores to find more parcels
+        // true deadlock (no parcels ever) is handled by the execution guard in agent.js
     }
 
     // GOTO desires — LLM-injected tile goals
@@ -134,7 +147,7 @@ function filterIntentions(desires, currentIntention, epsilon) {
  * @param {Map<string, object>} knownAgents  belief agents (their tiles are avoided)
  * @returns {string[] | null}
  */
-function computePath(from, to, walkable, exitDirs, knownAgents) {
+function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles = new Set()) {
     const sx = Math.round(from.x), sy = Math.round(from.y);
     const gx = to.x, gy = to.y;
     const startKey = `${sx},${sy}`;
@@ -153,9 +166,10 @@ function computePath(from, to, walkable, exitDirs, knownAgents) {
     const blocked = new Set(
         [...knownAgents.values()].map(a => `${Math.round(a.x)},${Math.round(a.y)}`)
     );
+    for (const key of forbiddenTiles) blocked.add(key);
     blocked.delete(startKey);
     if (blocked.size > 0) {
-        console.log(`[PATHFIND] ${blocked.size} agent(s) blocking`);
+        console.log(`[PATHFIND] ${blocked.size} tile(s) blocking (agents + forbidden)`);
     }
 
     const h = (x, y) => Math.abs(x - gx) + Math.abs(y - gy);
@@ -274,12 +288,14 @@ async function stepToward(target, agent) {
         }
     }
     
+    const forbidden = agent.beliefs.missionConstraints?.forbiddenTiles ?? new Set();
     const path = computePath(
         { x: agent.x, y: agent.y },
         target,
         agent.beliefs.map.walkable,
         agent.beliefs.map.exitDirs,
-        agent.beliefs.agents
+        agent.beliefs.agents,
+        forbidden
     );
 
     if (path === null) {

@@ -5,6 +5,7 @@ import { logLLM } from '../logger.js'
 const baseURL = process.env.LITELLM_BASE_URL ?? 'https://llm.bears.disi.unitn.it/v1'
 const apiKey  = process.env.LITELLM_API_KEY
 const MODEL   = process.env.LOCAL_MODEL ?? 'llama-3.3-70b-lmstudio'
+const DECAY   = parseFloat(process.env.DECAY_RATE) || 0.1
 
 let client = null
 if (!apiKey) {
@@ -13,7 +14,7 @@ if (!apiKey) {
     client = new OpenAI({ baseURL, apiKey })
 }
 
-// ─── ReAct helpers (copied from llm_agent.js — cannot import that file, it runs process.exit at scope) ───
+// ─── ReAct helpers ───────────────────────────────────────────────────────────
 
 async function callModel(messages, { temperature = 0 } = {}) {
     const response = await client.chat.completions.create({ model: MODEL, messages, temperature })
@@ -35,7 +36,7 @@ function extractFinalAnswer(text) {
     return match ? match[1].trim() : null
 }
 
-// ─── Tool helpers ───
+// ─── Standard tools ───────────────────────────────────────────────────────────
 
 function calculate(expression) {
     try {
@@ -88,49 +89,248 @@ function replyToSender(message, replyFn) {
     }
 }
 
-// ─── System prompt ───
+// ─── L2 Mission tools ─────────────────────────────────────────────────────────
+
+function setStackRequirement(input, beliefs) {
+    try {
+        const { min, max } = JSON.parse(input)
+        if (min !== null && min !== undefined && (!Number.isInteger(min) || min < 1)) {
+            return 'Error: min must be a positive integer or null'
+        }
+        if (max !== null && max !== undefined && (!Number.isInteger(max) || max < 1)) {
+            return 'Error: max must be a positive integer or null'
+        }
+        beliefs.missionConstraints.stack = {
+            min: min ?? null,
+            max: max ?? null,
+        }
+        return `Stack constraint set: min=${min ?? 'none'} max=${max ?? 'none'}`
+    } catch (e) {
+        return `Error: invalid JSON. Expected: {"min": N or null, "max": N or null}. Got: ${input}`
+    }
+}
+
+function setPreferredDeliveryTiles(input, beliefs) {
+    try {
+        const { tiles, multiplier } = JSON.parse(input)
+        if (!Array.isArray(tiles) || tiles.length === 0) {
+            return 'Error: tiles must be a non-empty array of {x, y} objects'
+        }
+        for (const t of tiles) {
+            if (typeof t.x !== 'number' || typeof t.y !== 'number') {
+                return 'Error: each tile must have numeric x and y'
+            }
+        }
+        beliefs.missionConstraints.preferredDeliveryTiles = tiles.map(t => ({ x: Math.round(t.x), y: Math.round(t.y) }))
+        beliefs.missionConstraints.preferredDeliveryMultiplier = multiplier ?? 1
+        const tileStr = beliefs.missionConstraints.preferredDeliveryTiles.map(t => `(${t.x},${t.y})`).join(', ')
+        return `Preferred delivery tiles set: ${tileStr} with multiplier ${multiplier ?? 1}`
+    } catch (e) {
+        return `Error: invalid JSON. Expected: {"tiles": [{x,y},...], "multiplier": N}. Got: ${input}`
+    }
+}
+
+function blacklistDeliveryTile(input, beliefs) {
+    try {
+        const { x, y } = JSON.parse(input)
+        if (typeof x !== 'number' || typeof y !== 'number') {
+            return 'Error: x and y must be numbers'
+        }
+        const key = `${Math.round(x)},${Math.round(y)}`
+        beliefs.missionConstraints.blacklistedDeliveryTiles.add(key)
+        return `Delivery tile (${Math.round(x)},${Math.round(y)}) blacklisted`
+    } catch (e) {
+        return `Error: invalid JSON. Expected: {"x": N, "y": N}. Got: ${input}`
+    }
+}
+
+function setRewardCap(input, beliefs) {
+    try {
+        const cap = parseFloat(input)
+        if (isNaN(cap) || cap <= 0) return 'Error: cap must be a positive number'
+        beliefs.missionConstraints.rewardCap = cap
+        return `Reward cap set: skip parcels with reward > ${cap}`
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
+function addForbiddenTile(input, beliefs) {
+    try {
+        const { x, y } = JSON.parse(input)
+        if (typeof x !== 'number' || typeof y !== 'number') {
+            return 'Error: x and y must be numbers'
+        }
+        const key = `${Math.round(x)},${Math.round(y)}`
+        beliefs.missionConstraints.forbiddenTiles.add(key)
+        return `Tile (${Math.round(x)},${Math.round(y)}) added to forbidden set — pathfinding will avoid it`
+    } catch (e) {
+        return `Error: invalid JSON. Expected: {"x": N, "y": N}. Got: ${input}`
+    }
+}
+
+function getMissionState(beliefs) {
+    const c = beliefs.missionConstraints
+    return JSON.stringify({
+        stack: c.stack,
+        preferredDeliveryTiles: c.preferredDeliveryTiles,
+        preferredDeliveryMultiplier: c.preferredDeliveryMultiplier,
+        blacklistedDeliveryTiles: [...c.blacklistedDeliveryTiles],
+        rewardCap: c.rewardCap,
+        forbiddenTiles: [...c.forbiddenTiles],
+        hasMission: c.stack.min !== null || c.stack.max !== null
+            || c.preferredDeliveryTiles !== null
+            || c.blacklistedDeliveryTiles.size > 0
+            || c.rewardCap !== null
+            || c.forbiddenTiles.size > 0,
+    })
+}
+
+function resetMission(beliefs) {
+    const c = beliefs.missionConstraints
+    c.stack = { min: null, max: null }
+    c.preferredDeliveryTiles = null
+    c.preferredDeliveryMultiplier = 1
+    c.blacklistedDeliveryTiles.clear()
+    c.rewardCap = null
+    c.forbiddenTiles.clear()
+    return 'Mission reset — all constraints cleared, returning to standard play'
+}
+
+function evaluateMission(input, beliefs, getGameStats) {
+    try {
+        const params = JSON.parse(input)
+        const { type } = params
+        const stats = getGameStats()
+        const avgReward = stats.avgReward ?? 10
+        const avgCollectTime = (stats.movementDuration ?? 500) / 1000 * 5  // rough 5-step estimate
+        const pps = stats.pointsPerSecond ?? 1
+
+        let ev, missionGain, standardGain, note
+
+        if (type === 'stack') {
+            const n = params.n ?? params.min ?? 3
+            const multiplier = params.multiplier ?? 1
+            const tempoTotale = n * avgCollectTime
+            const decayMedio = Math.min(0.99, DECAY * (n / 2) * avgCollectTime)
+            missionGain = n * avgReward * multiplier * (1 - decayMedio)
+            standardGain = pps * tempoTotale
+            ev = missionGain - standardGain
+            note = `Stack ${n} parcels (multiplier ${multiplier}x). Estimated collection time: ${tempoTotale.toFixed(1)}s`
+
+        } else if (type === 'preferred_tile') {
+            const multiplier = params.multiplier ?? 1
+            const extraSteps = params.extra_steps ?? 3
+            const avgCarried = stats.capacity ?? 3
+            missionGain = avgCarried * avgReward * multiplier
+            standardGain = avgCarried * avgReward + DECAY * avgReward * extraSteps
+            ev = missionGain - standardGain
+            note = `Deliver at preferred tile (${multiplier}x reward, ~${extraSteps} extra steps vs nearest tile)`
+
+        } else if (type === 'blacklist') {
+            ev = -Infinity
+            missionGain = 0
+            standardGain = Infinity
+            note = 'Blacklisted tile yields 0 pts — always reject'
+
+        } else if (type === 'reward_cap') {
+            const cap = params.cap ?? 10
+            const fracAboveCap = Math.max(0, 1 - cap / (avgReward * 2))
+            missionGain = avgReward * (1 - fracAboveCap)
+            standardGain = avgReward
+            ev = missionGain - standardGain
+            note = `Cap ${cap}: ~${(fracAboveCap * 100).toFixed(0)}% of parcels above cap will be skipped`
+
+        } else if (type === 'forbidden_tile') {
+            const extraSteps = params.extra_steps ?? 2
+            const penalty = params.penalty ?? 50
+            const probEnter = params.prob_enter ?? 0.3
+            const detourCost = DECAY * avgReward * extraSteps
+            const penaltyAvoided = penalty * probEnter
+            ev = penaltyAvoided - detourCost
+            missionGain = penaltyAvoided
+            standardGain = detourCost
+            note = `Avoid tile: saves ~${penaltyAvoided.toFixed(1)} penalty pts, costs ~${detourCost.toFixed(1)} pts in detours`
+
+        } else {
+            return `Error: unknown mission type "${type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile`
+        }
+
+        const rec = ev > 0
+            ? `ACCEPT (EV = +${ev.toFixed(2)})`
+            : `REJECT (EV = ${isFinite(ev) ? ev.toFixed(2) : '-Infinity'})`
+
+        return JSON.stringify({ ev: isFinite(ev) ? ev : -999999, missionGain, standardGain, note, recommendation: rec })
+    } catch (e) {
+        return `Error: ${e.message}. Input was: ${input}`
+    }
+}
+
+// ─── System prompt ────────────────────────────────────────────────────────────
 
 const MISSION_SYSTEM_PROMPT = `
 You are an AI assistant embedded in a BDI agent playing a parcel delivery game (Deliveroo.js).
-Your ONLY job is to interpret special mission messages and use tools to configure the agent's behaviour.
+Your ONLY job is to interpret special mission messages, evaluate them, and configure the agent's behaviour.
 
 == GAME CONTEXT ==
-Grid-based game. Coordinates: right=x+1, up=y+1. Agent collects parcels from spawn tiles and delivers them to delivery tiles to earn points.
-Setting a tile utility directs the BDI agent to move to that tile — it competes with normal parcel pick-up in deliberation.
+Grid-based game. Coordinates: right=x+1, up=y+1. Agent collects parcels from spawn tiles, delivers to delivery tiles.
+Parcel rewards decay over time — act fast. Standard play: pick nearest parcel, deliver to nearest tile.
+
+== MISSION TYPES ==
+
+TYPE 1 — ATOMIC: One-shot action (GOTO or answer a question).
+TYPE 2 — INTERMEDIATE: Persistent strategy change. Requires evaluate_mission then L2 setter tools.
+  Examples: stack N parcels, deliver only at tile (x,y), avoid tile (x,y), skip high-reward parcels.
 
 == TOOLS ==
-1. get_agent_state
-   Input: (empty string)
-   Returns: JSON {x, y, score, mapInfo: {deliveryTilesCount, spawnTilesCount}}
 
-2. calculate
-   Input: a math expression string, e.g. "4*2" or "(1+3)*3"
-   Returns: the computed result as a string, or an error string.
+STANDARD:
+1. get_agent_state — Input: "" — Returns: {x, y, score, mapInfo}
+2. calculate — Input: math expression string — Returns: computed result
+3. set_tile_utility — Input: {"x":N,"y":N,"utility":N} — Directs BDI to go to tile (positive utility only)
+4. reply_to_sender — Input: plain text string — Sends reply to mission sender
 
-3. set_tile_utility
-   Input: JSON string {"x": N, "y": N, "utility": N}
-   Action: directs the BDI agent to navigate to tile (x, y) with given priority.
-   Constraint: utility MUST be a positive number. Never call this for negative or zero reward missions.
+INTERMEDIATE MISSION EVALUATION:
+5. evaluate_mission — Input: JSON with "type" field — Returns EV analysis and recommendation
+   Types and params:
+   - {"type":"stack", "n":3, "multiplier":2.0}           — deliver N parcels at once for multiplier reward
+   - {"type":"preferred_tile", "multiplier":5, "extra_steps":3}  — deliver at specific tiles for bonus
+   - {"type":"blacklist"}                                  — EV always -Infinity (always reject)
+   - {"type":"reward_cap", "cap":10}                       — skip high-reward parcels
+   - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
 
-4. reply_to_sender
-   Input: a plain text message string
-   Action: sends a message back to the agent who sent this mission.
+INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
+6. set_stack_requirement — Input: {"min":N or null, "max":N or null}
+   - "exactly N": {"min":N,"max":N}   — "at least N": {"min":N,"max":null}   — "at most N": {"min":null,"max":N}
+7. set_preferred_delivery_tiles — Input: {"tiles":[{"x":N,"y":N},...], "multiplier":M}
+8. blacklist_delivery_tile — Input: {"x":N,"y":N} — Never deliver here
+9. set_reward_cap — Input: number string, e.g. "10.5" — Skip parcels above this reward
+10. add_forbidden_tile — Input: {"x":N,"y":N} — Pathfinding avoids this tile
+11. get_mission_state — Input: "" — Returns current constraints snapshot
+12. reset_mission — Input: "" — Clears all constraints
 
 == MISSION HANDLING RULES ==
 
-RULE 1 — Always call get_agent_state first to understand the current game context.
+RULE 1 — Always call get_agent_state first.
 
 RULE 2 — GOTO mission ("move to (x,y) and get +N pts"):
-  - If coordinates contain math expressions (e.g. x=4*2), call calculate for each expression first.
-  - If reward > 0: call set_tile_utility({"x": x, "y": y, "utility": reward}), then Final Answer "Mission accepted: going to (x,y) for +N pts"
-  - If reward <= 0: do NOT call set_tile_utility. Final Answer: "Mission rejected: negative/zero reward"
+  - If coordinates contain math (e.g. x=4*2), call calculate first.
+  - If reward > 0: call set_tile_utility, then Final Answer.
+  - If reward ≤ 0: Final Answer "Mission rejected: negative/zero reward".
 
-RULE 3 — Knowledge/question mission ("what is X? send answer to agent who sent the prompt"):
-  - Answer the question and call reply_to_sender with your answer.
-  - Then give Final Answer summarising what you replied.
+RULE 3 — Knowledge/question mission: answer and call reply_to_sender, then Final Answer.
 
-RULE 4 — Utility value must equal the exact numerical reward stated in the mission (e.g. "+10pts" → utility 10).
-  Do not scale, round up, or invent the utility value.
+RULE 4 — INTERMEDIATE mission (stack / preferred tile / blacklist / reward cap / forbidden tile):
+  Step 1: call evaluate_mission with the appropriate type and params.
+  Step 2a: if EV > 0 → call the relevant L2 setter tool(s), then call get_mission_state to confirm, then Final Answer "accepted".
+  Step 2b: if EV ≤ 0 → Final Answer "rejected: {reason from EV analysis}".
+
+RULE 5 — Stack missions:
+  "exactly N" → set_stack_requirement({"min":N,"max":N})
+  "at least N" → set_stack_requirement({"min":N,"max":null})
+  "at most N" → set_stack_requirement({"min":null,"max":N})
+
+RULE 6 — Utility value for set_tile_utility MUST equal the exact numerical reward stated (e.g. "+10pts" → utility 10).
 
 == OUTPUT FORMAT — choose exactly one per message ==
 
@@ -146,9 +346,9 @@ Final Answer: <outcome summary>
 Never output Action and Final Answer in the same message. Never write "Action: None". Do not invent tool results.
 `.trim()
 
-// ─── Main export ───
+// ─── Main export ──────────────────────────────────────────────────────────────
 
-export async function interpretMission(senderName, msg, beliefs, getState, replyFn) {
+export async function interpretMission(senderName, msg, beliefs, getState, replyFn, getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 })) {
     if (!client) {
         logLLM('[MissionInterpreter] No LLM client — skipping mission interpretation')
         return
@@ -157,10 +357,18 @@ export async function interpretMission(senderName, msg, beliefs, getState, reply
     logLLM(`[MissionInterpreter] Interpreting mission from ${senderName}: "${msg}"`)
 
     const TOOLS = {
-        get_agent_state: (_input) => getAgentState(beliefs, getState),
-        calculate:       (input)  => calculate(input),
-        set_tile_utility:(input)  => setTileUtility(input, beliefs),
-        reply_to_sender: (input)  => replyToSender(input, replyFn),
+        get_agent_state:               (_input) => getAgentState(beliefs, getState),
+        calculate:                     (input)  => calculate(input),
+        set_tile_utility:              (input)  => setTileUtility(input, beliefs),
+        reply_to_sender:               (input)  => replyToSender(input, replyFn),
+        evaluate_mission:              (input)  => evaluateMission(input, beliefs, getGameStats),
+        set_stack_requirement:         (input)  => setStackRequirement(input, beliefs),
+        set_preferred_delivery_tiles:  (input)  => setPreferredDeliveryTiles(input, beliefs),
+        blacklist_delivery_tile:       (input)  => blacklistDeliveryTile(input, beliefs),
+        set_reward_cap:                (input)  => setRewardCap(input, beliefs),
+        add_forbidden_tile:            (input)  => addForbiddenTile(input, beliefs),
+        get_mission_state:             (_input) => getMissionState(beliefs),
+        reset_mission:                 (_input) => resetMission(beliefs),
     }
 
     const messages = [
@@ -168,7 +376,7 @@ export async function interpretMission(senderName, msg, beliefs, getState, reply
         { role: 'user',   content: `[MISSION from ${senderName}]: "${msg}"` },
     ]
 
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
         logLLM(`[MissionInterpreter] --- iteration ${i + 1} ---`)
 
         const assistantText = await callModel(messages, { temperature: 0 })

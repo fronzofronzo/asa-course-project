@@ -18,6 +18,14 @@ class BeliefSet {
         this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
         this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
         this.tileUtilities = new Map(); // "x,y" → number (LLM-injected tile goals)
+        this.missionConstraints = {
+            stack: { min: null, max: null },        // {min: int|null, max: int|null}
+            preferredDeliveryTiles: null,           // [{x,y}] | null — deliver ONLY here
+            preferredDeliveryMultiplier: 1,         // float, used in EV display
+            blacklistedDeliveryTiles: new Set(),    // Set<"x,y">
+            rewardCap: null,                        // float | null
+            forbiddenTiles: new Set(),              // Set<"x,y">
+        };
     }
 
     /**

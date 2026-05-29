@@ -1,5 +1,5 @@
 import { go_to } from './deliberation.js';
-import { bfsDist, bfsDistDirected } from './utils.js';
+import { bfsDist, bfsDistDirected, getEffectiveDeliveryTiles } from './utils.js';
 import { log } from './logger.js';
 
 const UNREACHABLE_TIMEOUT_MS = 10000; // if delivery tile unreachable for this long, consider it blocked
@@ -95,9 +95,10 @@ async function explore(agent, visitedSpawns) {
  */
 function nearestDeliveryTile(agent, unreachableDeliveryTiles) {
     const { deliveryTiles, walkable, exitDirs } = agent.beliefs.map;
+    const effectiveDeliveryTiles = getEffectiveDeliveryTiles(deliveryTiles, agent.beliefs.missionConstraints ?? null);
     const agentPos = { x: Math.round(agent.x), y: Math.round(agent.y) };
     let best = null, bestScore = Infinity;
-    for (const tile of deliveryTiles) {
+    for (const tile of effectiveDeliveryTiles) {
         const elapsed = Date.now() - (unreachableDeliveryTiles.get(`${tile.x},${tile.y}`) || 0);
         const unreachablePenalty = Math.max(0, 1 - elapsed / UNREACHABLE_TIMEOUT_MS);
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);

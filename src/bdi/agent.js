@@ -4,6 +4,7 @@ import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } 
 import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
+import { log } from './logger.js';
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
@@ -23,6 +24,13 @@ class Agent {
         this.intention = null;       // { parcel, utility } | null
         this.carriedParcels = [];    // parcels currently carried
         this.stuckCount = 0;
+        this.gameConfig = null;      // populated by onConfig
+        this.gameStats = {
+            startTime: Date.now(),
+            avgReward: 10.0,     // overwritten from config on connect
+            lastScore: 0,
+            deliveries: [],      // [{reward, timestamp}] rolling last-20
+        };
 
         /** Flag to trigger deliberation on next loop iteration */
         this.needsDeliberation = false;
@@ -66,8 +74,21 @@ const agent = new Agent();
 agent.socket.onMap((width, height, tiles) => {
     agent.beliefs.updateMap(width, height, tiles);
 })
-agent.socket.onYou(({id, name, x, y, score}) => {
-    agent.updateInformation(id,name,x,y,score)
+agent.socket.onConfig((config) => {
+    agent.gameConfig = config.GAME ?? null;
+    if (config.GAME?.parcels?.reward_avg != null) {
+        agent.gameStats.avgReward = config.GAME.parcels.reward_avg;
+        console.log(`[CONFIG] avgReward from server: ${agent.gameStats.avgReward}`);
+    }
+})
+agent.socket.onYou(({id, name, x, y, score, penalty}) => {
+    const delta = score - agent.gameStats.lastScore;
+    if (delta > 0) {
+        agent.gameStats.deliveries.push({ reward: delta, timestamp: Date.now() });
+        if (agent.gameStats.deliveries.length > 20) agent.gameStats.deliveries.shift();
+    }
+    agent.gameStats.lastScore = score;
+    agent.updateInformation(id, name, x, y, score);
 })
 agent.socket.onSensing(({ agents, parcels }) => {
     agent.beliefs.updateBeliefs({ agents, parcels });
@@ -92,7 +113,21 @@ async function drainMissions() {
             await interpretMission(
                 name, msg, agent.beliefs,
                 () => ({ x: agent.x, y: agent.y, score: agent.score }),
-                replyFn
+                replyFn,
+                () => {
+                    const elapsed = (Date.now() - agent.gameStats.startTime) / 1000;
+                    const deliveries = agent.gameStats.deliveries;
+                    const avgDeliveryReward = deliveries.length > 0
+                        ? deliveries.reduce((s, d) => s + d.reward, 0) / deliveries.length
+                        : agent.gameStats.avgReward;
+                    return {
+                        avgReward: agent.gameStats.avgReward,
+                        avgDeliveryReward,
+                        capacity: agent.gameConfig?.player?.capacity ?? 5,
+                        movementDuration: agent.gameConfig?.player?.movement_duration ?? 500,
+                        pointsPerSecond: agent.score / Math.max(1, elapsed),
+                    };
+                }
             );
         } finally {
             llmBusy = false;
@@ -160,10 +195,25 @@ async function agentLoop() {
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
             if (onDelivery) {
-                const dropped = await agent.socket.emitPutdown();
-                console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                agent.stuckCount = 0;
-                agent.intention = null;
+                const stackMin = agent.beliefs.missionConstraints?.stack?.min ?? null;
+                if (stackMin !== null && carriedCount < stackMin) {
+                    // stack not full — only deliver if no parcels left to collect (deadlock prevention)
+                    const uncarriedExists = [...agent.beliefs.parcels.values()].some(p => p.carriedBy === null);
+                    if (uncarriedExists) {
+                        console.log(`[STACK] Carrying ${carriedCount}/${stackMin} min — aborting delivery, parcels still exist`);
+                        agent.intention = null; // re-deliberate: find more parcels
+                    } else {
+                        const dropped = await agent.socket.emitPutdown();
+                        console.log(`[STACK] Carrying ${carriedCount}/${stackMin} min — delivering anyway (no more parcels to collect)`);
+                        agent.stuckCount = 0;
+                        agent.intention = null;
+                    }
+                } else {
+                    const dropped = await agent.socket.emitPutdown();
+                    console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                    agent.stuckCount = 0;
+                    agent.intention = null;
+                }
             } else {
                 const target = nearestDeliveryTile(agent, unreachableDeliveryTiles);
                 if (target) {
@@ -190,7 +240,17 @@ async function agentLoop() {
                 console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
                 const pickedUp = await agent.socket.emitPickup();
                 if (pickedUp?.length > 0) {
-                    console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);
+                    const stackMax = agent.beliefs.missionConstraints?.stack?.max ?? null;
+                    const newTotal = carriedCount + pickedUp.length;
+                    if (stackMax !== null && newTotal > stackMax) {
+                        // emitPickup grabbed more than stack.max allows — drop excess immediately
+                        const excess = newTotal - stackMax;
+                        const toDrop = pickedUp.slice(pickedUp.length - excess).map(q => q.id);
+                        await agent.socket.emitPutdown(toDrop);
+                        console.log(`[STACK] Picked up ${pickedUp.length}, dropped ${toDrop.length} excess to stay at max=${stackMax}`);
+                    } else {
+                        console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);
+                    }
                     agent.intention = null;
                     agent.stuckCount = 0;
                 } else {
@@ -282,4 +342,17 @@ async function agentLoop() {
 
 agentLoop();
 
-setInterval(() => agent.beliefs.log(), 3000);
+setInterval(() => {
+    agent.beliefs.log();
+    const c = agent.beliefs.missionConstraints;
+    const hasMission = c.stack.min !== null || c.stack.max !== null
+        || c.preferredDeliveryTiles !== null
+        || c.blacklistedDeliveryTiles.size > 0
+        || c.rewardCap !== null
+        || c.forbiddenTiles.size > 0;
+    if (hasMission) {
+        log(`[MISSION_CONSTRAINTS] stack={min:${c.stack.min},max:${c.stack.max}} | preferredTiles=${c.preferredDeliveryTiles ? JSON.stringify(c.preferredDeliveryTiles) + `(x${c.preferredDeliveryMultiplier})` : 'none'} | blacklist=[${[...c.blacklistedDeliveryTiles].join(',')}] | rewardCap=${c.rewardCap ?? 'none'} | forbidden=[${[...c.forbiddenTiles].join(',')}]`);
+    } else {
+        log('[MISSION_CONSTRAINTS] none active — standard play');
+    }
+}, 3000);
