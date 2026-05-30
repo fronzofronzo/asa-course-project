@@ -1,5 +1,17 @@
 # Mission Constraints — Plugin/Registry Pattern
 
+## Design Patterns Used
+
+This system combines three classical patterns:
+
+- **Plugin / Strategy**: each constraint is an independent class with the same interface (`Constraint`). New constraints can be added without touching any existing code — this is the **Open/Closed Principle** from SOLID.
+
+- **Registry**: `MissionConstraints` holds a list of all active plugins and acts as the single access point. Callers never know which constraints exist; they only talk to the registry.
+
+- **Chain of Responsibility**: operations like `checkPickup`, `checkPutdown`, and `computeEV` walk the list and stop at the first handler that returns a non-null result.
+
+---
+
 ## The Problem
 
 Before this refactor, every mission constraint was a field on a plain object:
