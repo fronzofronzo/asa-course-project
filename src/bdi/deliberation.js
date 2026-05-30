@@ -34,7 +34,7 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
     // parcel with low belief score is probably gone — skip immediately
     if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
     // skip parcels exceeding reward cap
-    if (constraints?.rewardCap !== null && constraints?.rewardCap !== undefined && parcel.reward > constraints.rewardCap) return -Infinity;
+    if (constraints?.rewardCap.cap !== null && parcel.reward > constraints.rewardCap.cap) return -Infinity;
 
     const stepsToParcel = bfsDist(agentPos, parcel, walkable);
     if (stepsToParcel === Infinity) return -Infinity;
@@ -288,7 +288,7 @@ async function stepToward(target, agent) {
         }
     }
     
-    const forbidden = agent.beliefs.missionConstraints?.forbiddenTiles ?? new Set();
+    const forbidden = agent.beliefs.missionConstraints?.forbidden.tiles ?? new Set();
     const path = computePath(
         { x: agent.x, y: agent.y },
         target,

@@ -100,10 +100,7 @@ function setStackRequirement(input, beliefs) {
         if (max !== null && max !== undefined && (!Number.isInteger(max) || max < 1)) {
             return 'Error: max must be a positive integer or null'
         }
-        beliefs.missionConstraints.stack = {
-            min: min ?? null,
-            max: max ?? null,
-        }
+        beliefs.missionConstraints.stack.setMinMax(min ?? null, max ?? null)
         return `Stack constraint set: min=${min ?? 'none'} max=${max ?? 'none'}`
     } catch (e) {
         return `Error: invalid JSON. Expected: {"min": N or null, "max": N or null}. Got: ${input}`
@@ -121,9 +118,8 @@ function setPreferredDeliveryTiles(input, beliefs) {
                 return 'Error: each tile must have numeric x and y'
             }
         }
-        beliefs.missionConstraints.preferredDeliveryTiles = tiles.map(t => ({ x: Math.round(t.x), y: Math.round(t.y) }))
-        beliefs.missionConstraints.preferredDeliveryMultiplier = multiplier ?? 1
-        const tileStr = beliefs.missionConstraints.preferredDeliveryTiles.map(t => `(${t.x},${t.y})`).join(', ')
+        beliefs.missionConstraints.preferred.set(tiles, multiplier ?? 1)
+        const tileStr = beliefs.missionConstraints.preferred.tiles.map(t => `(${t.x},${t.y})`).join(', ')
         return `Preferred delivery tiles set: ${tileStr} with multiplier ${multiplier ?? 1}`
     } catch (e) {
         return `Error: invalid JSON. Expected: {"tiles": [{x,y},...], "multiplier": N}. Got: ${input}`
@@ -136,8 +132,7 @@ function blacklistDeliveryTile(input, beliefs) {
         if (typeof x !== 'number' || typeof y !== 'number') {
             return 'Error: x and y must be numbers'
         }
-        const key = `${Math.round(x)},${Math.round(y)}`
-        beliefs.missionConstraints.blacklistedDeliveryTiles.add(key)
+        beliefs.missionConstraints.blacklist.add(x, y)
         return `Delivery tile (${Math.round(x)},${Math.round(y)}) blacklisted`
     } catch (e) {
         return `Error: invalid JSON. Expected: {"x": N, "y": N}. Got: ${input}`
@@ -148,7 +143,7 @@ function setRewardCap(input, beliefs) {
     try {
         const cap = parseFloat(input)
         if (isNaN(cap) || cap <= 0) return 'Error: cap must be a positive number'
-        beliefs.missionConstraints.rewardCap = cap
+        beliefs.missionConstraints.rewardCap.set(cap)
         return `Reward cap set: skip parcels with reward > ${cap}`
     } catch (e) {
         return `Error: ${e.message}`
@@ -161,8 +156,7 @@ function addForbiddenTile(input, beliefs) {
         if (typeof x !== 'number' || typeof y !== 'number') {
             return 'Error: x and y must be numbers'
         }
-        const key = `${Math.round(x)},${Math.round(y)}`
-        beliefs.missionConstraints.forbiddenTiles.add(key)
+        beliefs.missionConstraints.forbidden.add(x, y)
         return `Tile (${Math.round(x)},${Math.round(y)}) added to forbidden set — pathfinding will avoid it`
     } catch (e) {
         return `Error: invalid JSON. Expected: {"x": N, "y": N}. Got: ${input}`
@@ -171,96 +165,46 @@ function addForbiddenTile(input, beliefs) {
 
 function getMissionState(beliefs) {
     const c = beliefs.missionConstraints
-    return JSON.stringify({
-        stack: c.stack,
-        preferredDeliveryTiles: c.preferredDeliveryTiles,
-        preferredDeliveryMultiplier: c.preferredDeliveryMultiplier,
-        blacklistedDeliveryTiles: [...c.blacklistedDeliveryTiles],
-        rewardCap: c.rewardCap,
-        forbiddenTiles: [...c.forbiddenTiles],
-        hasMission: c.stack.min !== null || c.stack.max !== null
-            || c.preferredDeliveryTiles !== null
-            || c.blacklistedDeliveryTiles.size > 0
-            || c.rewardCap !== null
-            || c.forbiddenTiles.size > 0,
-    })
+    return JSON.stringify({ ...c.toJSON(), hasMission: c.hasMission() })
 }
 
 function resetMission(beliefs) {
-    const c = beliefs.missionConstraints
-    c.stack = { min: null, max: null }
-    c.preferredDeliveryTiles = null
-    c.preferredDeliveryMultiplier = 1
-    c.blacklistedDeliveryTiles.clear()
-    c.rewardCap = null
-    c.forbiddenTiles.clear()
+    beliefs.missionConstraints.reset()
     return 'Mission reset — all constraints cleared, returning to standard play'
 }
 
 function evaluateMission(input, beliefs, getGameStats) {
     try {
         const params = JSON.parse(input)
-        const { type } = params
         const stats = getGameStats()
-        const avgReward = stats.avgReward ?? 10
-        const avgCollectTime = (stats.movementDuration ?? 500) / 1000 * 5  // rough 5-step estimate
-        const pps = stats.pointsPerSecond ?? 1
+        const normalizedStats = {
+            avgReward:       stats.avgReward ?? 10,
+            avgCollectTime:  (stats.movementDuration ?? 500) / 1000 * 5,
+            decay:           DECAY,
+            pps:             stats.pointsPerSecond ?? 1,
+        }
 
-        let ev, missionGain, standardGain, note
+        const result = beliefs.missionConstraints.computeEV(params, normalizedStats)
+        if (!result) {
+            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile`
+        }
 
-        if (type === 'stack') {
-            const n = params.n ?? params.min ?? 3
-            const multiplier = params.multiplier ?? 1
-            const tempoTotale = n * avgCollectTime
-            const decayMedio = Math.min(0.99, DECAY * (n / 2) * avgCollectTime)
-            missionGain = n * avgReward * multiplier * (1 - decayMedio)
-            standardGain = pps * tempoTotale
-            ev = missionGain - standardGain
-            note = `Stack ${n} parcels (multiplier ${multiplier}x). Estimated collection time: ${tempoTotale.toFixed(1)}s`
+        const { ev, guadagnoMissione: missionGain, guadagnoStandard: standardGain } = result
+        const n = params.n ?? params.min ?? 3
 
-        } else if (type === 'preferred_tile') {
-            const multiplier = params.multiplier ?? 1
-            const extraSteps = params.extra_steps ?? 3
-            const avgCarried = stats.capacity ?? 3
-            missionGain = avgCarried * avgReward * multiplier
-            standardGain = avgCarried * avgReward + DECAY * avgReward * extraSteps
-            ev = missionGain - standardGain
-            note = `Deliver at preferred tile (${multiplier}x reward, ~${extraSteps} extra steps vs nearest tile)`
-
-        } else if (type === 'blacklist') {
-            ev = -Infinity
-            missionGain = 0
-            standardGain = Infinity
-            note = 'Blacklisted tile yields 0 pts — always reject'
-
-        } else if (type === 'reward_cap') {
-            const cap = params.cap ?? 10
-            const fracAboveCap = Math.max(0, 1 - cap / (avgReward * 2))
-            missionGain = avgReward * (1 - fracAboveCap)
-            standardGain = avgReward
-            ev = missionGain - standardGain
-            note = `Cap ${cap}: ~${(fracAboveCap * 100).toFixed(0)}% of parcels above cap will be skipped`
-
-        } else if (type === 'forbidden_tile') {
-            const extraSteps = params.extra_steps ?? 2
-            const penalty = params.penalty ?? 50
-            const probEnter = params.prob_enter ?? 0.3
-            const detourCost = DECAY * avgReward * extraSteps
-            const penaltyAvoided = penalty * probEnter
-            ev = penaltyAvoided - detourCost
-            missionGain = penaltyAvoided
-            standardGain = detourCost
-            note = `Avoid tile: saves ~${penaltyAvoided.toFixed(1)} penalty pts, costs ~${detourCost.toFixed(1)} pts in detours`
-
-        } else {
-            return `Error: unknown mission type "${type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile`
+        const noteMap = {
+            stack:          `Stack ${n} parcels (multiplier ${params.multiplier ?? 1}x). Estimated collection time: ${(n * normalizedStats.avgCollectTime).toFixed(1)}s`,
+            preferred_tile: `Deliver at preferred tile (${params.multiplier ?? 1}x reward, ~${params.extra_steps ?? 3} extra steps vs nearest tile)`,
+            blacklist:      'Blacklisted tile yields 0 pts — always reject',
+            reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap will be skipped`,
+            forbidden_tile: `Avoid tile: saves ~${((params.penalty ?? 50) * (params.prob_enter ?? 0.3)).toFixed(1)} penalty pts, costs ~${(DECAY * normalizedStats.avgReward * (params.extra_steps ?? 2)).toFixed(1)} pts in detours`,
         }
 
         const rec = ev > 0
             ? `ACCEPT (EV = +${ev.toFixed(2)})`
             : `REJECT (EV = ${isFinite(ev) ? ev.toFixed(2) : '-Infinity'})`
 
-        return JSON.stringify({ ev: isFinite(ev) ? ev : -999999, missionGain, standardGain, note, recommendation: rec })
+        return JSON.stringify({ ev: isFinite(ev) ? ev : -999999, missionGain, standardGain, note: noteMap[params.type] ?? '', recommendation: rec })
     } catch (e) {
         return `Error: ${e.message}. Input was: ${input}`
     }

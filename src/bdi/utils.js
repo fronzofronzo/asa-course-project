@@ -86,18 +86,18 @@ function computeSpawnHeat(tile, tiles, radius) {
  * Filter delivery tiles by mission constraints (preferred + blacklist).
  * Falls back to full list if filtering would leave no tiles.
  * @param {{ x:number, y:number }[]} all
- * @param {{ preferredDeliveryTiles: {x,y}[]|null, blacklistedDeliveryTiles: Set<string> }|null} constraints
+ * @param {import('./llm/constraints/MissionConstraints.js').MissionConstraints|null} constraints
  * @returns {{ x:number, y:number }[]}
  */
 function getEffectiveDeliveryTiles(all, constraints) {
     if (!constraints) return all;
     let tiles = all;
-    const pref = constraints.preferredDeliveryTiles;
+    const pref = constraints.preferred.tiles;
     if (pref && pref.length > 0) {
         const filtered = all.filter(t => pref.some(p => p.x === t.x && p.y === t.y));
         if (filtered.length > 0) tiles = filtered;
     }
-    const bl = constraints.blacklistedDeliveryTiles;
+    const bl = constraints.blacklist.tiles;
     if (bl && bl.size > 0) {
         const filtered = tiles.filter(t => !bl.has(`${t.x},${t.y}`));
         if (filtered.length > 0) tiles = filtered;

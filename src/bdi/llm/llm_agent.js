@@ -1,5 +1,6 @@
 import "dotenv/config";
 import OpenAI from "openai";
+import { MissionConstraints } from './constraints/MissionConstraints.js';
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
@@ -34,15 +35,7 @@ const world = {
 };
 
 // ─── L2 Mission State ────────────────────────────────────────────────────────
-// Holds all active mission constraints. null = no constraint (standard behavior).
-const missionState = {
-    stackSize: null,                      // deliver only when carrying >= N parcels
-    preferredDeliveryTiles: null,         // [{x, y}] — only deliver here when set
-    preferredDeliveryMultiplier: 1,       // reward multiplier for preferred tiles
-    blacklistedDeliveryTiles: new Set(),  // "x,y" keys — never deliver here (0 pts)
-    rewardCap: null,                      // skip parcels with reward > cap
-    forbiddenTiles: new Set(),            // "x,y" keys — avoid in navigation
-};
+const mission = new MissionConstraints();
 
 // ─── Map State ────────────────────────────────────────────────────────────────
 const mapState = {
@@ -82,15 +75,7 @@ function pointsPerSecond() {
     return elapsed > 10 ? me.score / elapsed : 1;
 }
 
-function hasMission() {
-    return (
-        missionState.stackSize !== null ||
-        missionState.preferredDeliveryTiles !== null ||
-        missionState.blacklistedDeliveryTiles.size > 0 ||
-        missionState.rewardCap !== null ||
-        missionState.forbiddenTiles.size > 0
-    );
-}
+function hasMission() { return mission.hasMission(); }
 
 // ─── Socket Handlers ──────────────────────────────────────────────────────────
 socket.onYou(({ id, name, x, y, score }) => {
@@ -125,7 +110,7 @@ socket.onSensing(async ({ agents, parcels }) => {
     busy = true;
     try {
         const carried = world.parcels.filter(p => p.carriedBy === me.id);
-        const stackOk = missionState.stackSize === null || carried.length >= missionState.stackSize;
+        const stackOk = mission.stack.isReady(carried);
         const prompt = stackOk && carried.length > 0
             ? "Autonomous turn: you have parcels to deliver. Check mission constraints and deliver them."
             : "Autonomous turn: pick up the nearest eligible parcel (respecting reward cap and stack size), or explore if none visible.";
@@ -243,11 +228,7 @@ async function getParcels() {
     console.log("---- GET PARCELS ----");
     if (me.x === null || me.y === null) return "Error: agent position not available yet.";
 
-    let free = world.parcels.filter(p => !p.carriedBy);
-
-    if (missionState.rewardCap !== null) {
-        free = free.filter(p => p.reward <= missionState.rewardCap);
-    }
+    let free = mission.filterParcels(world.parcels.filter(p => !p.carriedBy));
 
     if (free.length === 0) return "No eligible free parcels visible right now.";
 
@@ -282,7 +263,7 @@ function bfsPath(sx, sy, tx, ty) {
         for (const { d, dx, dy } of dirs) {
             const nx = x + dx, ny = y + dy;
             const key = `${nx},${ny}`;
-            if (missionState.forbiddenTiles.has(key)) continue;
+            if (mission.isForbidden(key)) continue;
             if (!mapState.walkable.has(key) || visited.has(key)) continue;
             const newPath = [...path, d];
             if (key === goalKey) return newPath;
@@ -307,7 +288,7 @@ async function navigateTo(args) {
 
     tx = Math.round(tx); ty = Math.round(ty);
 
-    if (missionState.forbiddenTiles.has(`${tx},${ty}`)) {
+    if (mission.isForbidden(`${tx},${ty}`)) {
         return `Error: target tile (${tx},${ty}) is forbidden. Choose a different destination.`;
     }
 
@@ -350,7 +331,7 @@ async function navigateTo(args) {
         let moved = false;
         for (const dir of candidates) {
             const [ddx, ddy] = dirDelta[dir];
-            if (missionState.forbiddenTiles.has(`${cx+ddx},${cy+ddy}`)) continue;
+            if (mission.isForbidden(`${cx+ddx},${cy+ddy}`)) continue;
             const result = await socket.emitMove(dir);
             steps++;
             if (result) { moved = true; break; }
@@ -364,26 +345,9 @@ async function navigateTo(args) {
 async function pickUp() {
     console.log("---- PICK UP ----");
 
-    // Reward cap check: warn if parcels on this tile exceed cap
-    if (missionState.rewardCap !== null) {
-        const overCap = world.parcels.filter(p =>
-            !p.carriedBy &&
-            Math.round(p.x) === Math.round(me.x) &&
-            Math.round(p.y) === Math.round(me.y) &&
-            p.reward > missionState.rewardCap
-        );
-        if (overCap.length > 0) {
-            return `Mission constraint: parcel reward (${overCap[0].reward.toFixed(1)}) exceeds cap (${missionState.rewardCap}). Skipping pickup.`;
-        }
-    }
-
-    // Stack size check: if already at limit, must deliver first
-    if (missionState.stackSize !== null) {
-        const carried = world.parcels.filter(p => p.carriedBy === me.id);
-        if (carried.length >= missionState.stackSize) {
-            return `Mission constraint: already carrying ${carried.length}/${missionState.stackSize} parcels. Deliver before picking up more.`;
-        }
-    }
+    const carried = world.parcels.filter(p => p.carriedBy === me.id);
+    const err = mission.checkPickup(carried, { me, world });
+    if (err) return err;
 
     try {
         const result = await socket.emitPickup();
@@ -408,19 +372,9 @@ async function putDown() {
 
     const cx = Math.round(me.x), cy = Math.round(me.y);
     const tileKey = `${cx},${cy}`;
-
-    // Blacklist check
-    if (missionState.blacklistedDeliveryTiles.has(tileKey)) {
-        return `Mission constraint: tile (${cx},${cy}) is blacklisted (0 pts). Navigate to a different delivery tile before putting down.`;
-    }
-
-    // Stack size check
-    if (missionState.stackSize !== null) {
-        const carried = world.parcels.filter(p => p.carriedBy === me.id);
-        if (carried.length < missionState.stackSize) {
-            return `Mission constraint: carrying ${carried.length}/${missionState.stackSize} required parcels. Collect ${missionState.stackSize - carried.length} more before delivering.`;
-        }
-    }
+    const carried = world.parcels.filter(p => p.carriedBy === me.id);
+    const err = mission.checkPutdown(tileKey, carried, { me, world });
+    if (err) return err;
 
     try {
         const result = await socket.emitPutdown();
@@ -440,11 +394,9 @@ function getDeliveryTiles() {
     if (mapState.deliveryTiles.length === 0) return "No delivery tiles found on this map.";
 
     const agentPos = { x: Math.round(me.x), y: Math.round(me.y) };
-    const withDist = mapState.deliveryTiles.map(t => ({
+    const withDist = mapState.deliveryTiles.map(t => mission.decorateDeliveryTile({
         x: t.x, y: t.y,
         distance: Math.abs(t.x - agentPos.x) + Math.abs(t.y - agentPos.y),
-        blacklisted: missionState.blacklistedDeliveryTiles.has(`${t.x},${t.y}`),
-        preferred: missionState.preferredDeliveryTiles?.some(p => p.x === t.x && p.y === t.y) ?? false,
     }));
     withDist.sort((a, b) => a.distance - b.distance);
     return JSON.stringify(withDist);
@@ -456,7 +408,7 @@ function setStackRequirement(input) {
     console.log("---- SET STACK REQUIREMENT ----");
     const n = parseInt(input);
     if (isNaN(n) || n < 1) return "Error: input must be a positive integer (e.g. 3).";
-    missionState.stackSize = n;
+    mission.stack.set(n);
     return `Stack requirement set: will only deliver when carrying >= ${n} parcels.`;
 }
 
@@ -468,9 +420,8 @@ function setPreferredDeliveryTiles(input) {
         if (!Array.isArray(tiles) || tiles.length === 0) {
             return 'Error: tiles must be a non-empty array, e.g. {"tiles":[{"x":1,"y":2}],"multiplier":5}';
         }
-        missionState.preferredDeliveryTiles = tiles.map(t => ({ x: Math.round(t.x), y: Math.round(t.y) }));
-        missionState.preferredDeliveryMultiplier = multiplier ?? 1;
-        return `Preferred delivery tiles set: ${JSON.stringify(missionState.preferredDeliveryTiles)} (multiplier: ${missionState.preferredDeliveryMultiplier}x). Navigate to one of these tiles to deliver.`;
+        mission.preferred.set(tiles, multiplier ?? 1);
+        return `Preferred delivery tiles set: ${JSON.stringify(mission.preferred.tiles)} (multiplier: ${mission.preferred.multiplier}x). Navigate to one of these tiles to deliver.`;
     } catch {
         return 'Error: expected JSON like {"tiles":[{"x":1,"y":2}],"multiplier":5}';
     }
@@ -480,8 +431,7 @@ function blacklistDeliveryTile(input) {
     console.log("---- BLACKLIST DELIVERY TILE ----");
     try {
         const { x, y } = JSON.parse(input);
-        const key = `${Math.round(x)},${Math.round(y)}`;
-        missionState.blacklistedDeliveryTiles.add(key);
+        mission.blacklist.add(x, y);
         return `Tile (${Math.round(x)},${Math.round(y)}) blacklisted. put_down will refuse to deliver there.`;
     } catch {
         return 'Error: expected JSON like {"x":1,"y":2}';
@@ -492,7 +442,7 @@ function setRewardCap(input) {
     console.log("---- SET REWARD CAP ----");
     const cap = parseFloat(input);
     if (isNaN(cap) || cap <= 0) return "Error: input must be a positive number.";
-    missionState.rewardCap = cap;
+    mission.rewardCap.set(cap);
     return `Reward cap set to ${cap}. pick_up and get_parcels will skip parcels with reward > ${cap}.`;
 }
 
@@ -500,8 +450,7 @@ function addForbiddenTile(input) {
     console.log("---- ADD FORBIDDEN TILE ----");
     try {
         const { x, y } = JSON.parse(input);
-        const key = `${Math.round(x)},${Math.round(y)}`;
-        missionState.forbiddenTiles.add(key);
+        mission.forbidden.add(x, y);
         return `Tile (${Math.round(x)},${Math.round(y)}) added to forbidden tiles. navigate_to will route around it.`;
     } catch {
         return 'Error: expected JSON like {"x":4,"y":7}';
@@ -510,25 +459,12 @@ function addForbiddenTile(input) {
 
 function getMissionState() {
     console.log("---- GET MISSION STATE ----");
-    return JSON.stringify({
-        stackSize: missionState.stackSize,
-        preferredDeliveryTiles: missionState.preferredDeliveryTiles,
-        preferredDeliveryMultiplier: missionState.preferredDeliveryMultiplier,
-        blacklistedDeliveryTiles: [...missionState.blacklistedDeliveryTiles],
-        rewardCap: missionState.rewardCap,
-        forbiddenTiles: [...missionState.forbiddenTiles],
-        hasMission: hasMission(),
-    });
+    return JSON.stringify({ ...mission.toJSON(), hasMission: mission.hasMission() });
 }
 
 function resetMission() {
     console.log("---- RESET MISSION ----");
-    missionState.stackSize = null;
-    missionState.preferredDeliveryTiles = null;
-    missionState.preferredDeliveryMultiplier = 1;
-    missionState.blacklistedDeliveryTiles.clear();
-    missionState.rewardCap = null;
-    missionState.forbiddenTiles.clear();
+    mission.reset();
     return "All mission constraints cleared. Back to standard behavior.";
 }
 
@@ -537,75 +473,30 @@ function evaluateMission(input) {
     console.log("---- EVALUATE MISSION ----");
     try {
         const params = JSON.parse(input);
-        const { type } = params;
         const decay = parseFloat(process.env.DECAY_RATE ?? "0.1");
-        const avgReward = gameStats.avgReward;
-        const avgCollect = gameStats.avgCollectTime;
-        const pps = pointsPerSecond();
+        const stats = {
+            avgReward: gameStats.avgReward,
+            avgCollectTime: gameStats.avgCollectTime,
+            decay,
+            pps: pointsPerSecond(),
+        };
 
-        let ev, guadagnoMissione, guadagnoStandard, raccomandazione;
-
-        if (type === "stack") {
-            // Stack N parcels, then deliver with multiplier M
-            const n = params.n ?? 3;
-            const m = params.multiplier ?? 1;
-            const tempoTotale = n * avgCollect;
-            // Average parcel waits (n-1)/2 collect cycles before delivery
-            const decayMedio = Math.min(0.99, decay * (n / 2) * avgCollect);
-            guadagnoMissione = n * avgReward * m * (1 - decayMedio);
-            guadagnoStandard = pps * tempoTotale;
-            ev = guadagnoMissione - guadagnoStandard;
-
-        } else if (type === "preferred_tile") {
-            // Deliver only at specific tile with multiplier M
-            const m = params.multiplier ?? 1;
-            const extraSteps = params.extra_steps ?? 5; // estimated extra walk steps
-            const avgCarried = avgReward;
-            guadagnoMissione = avgCarried * m;
-            guadagnoStandard = avgCarried + decay * avgCarried * extraSteps; // standard reward + decay cost
-            ev = guadagnoMissione - guadagnoStandard;
-
-        } else if (type === "blacklist") {
-            // Delivering at a specific tile gives 0 pts
-            ev = -Infinity;
-            guadagnoMissione = 0;
-            guadagnoStandard = avgReward;
-
-        } else if (type === "reward_cap") {
-            // Parcels with reward > cap give no reward
-            const cap = params.cap ?? 10;
-            // Estimate fraction above cap assuming rewards uniform in [0, avgReward*2]
-            const fracAboveCap = Math.max(0, 1 - cap / (avgReward * 2));
-            guadagnoMissione = avgReward * (1 - fracAboveCap);
-            guadagnoStandard = avgReward;
-            ev = guadagnoMissione - guadagnoStandard; // always <= 0
-
-        } else if (type === "forbidden_tile") {
-            // Tile to avoid, penalty if entered
-            const extraSteps = params.extra_steps ?? 3;
-            const penaltyAvoided = params.penalty ?? 50;
-            const probEnter = params.prob_enter ?? 0.2; // estimated probability of entering tile naturally
-            const costoDetour = decay * avgReward * extraSteps;
-            guadagnoMissione = penaltyAvoided * probEnter; // expected penalty avoided
-            guadagnoStandard = costoDetour;              // cost of routing around
-            ev = guadagnoMissione - guadagnoStandard;
-
-        } else {
-            return `Error: unknown type '${type}'. Valid: stack, preferred_tile, blacklist, reward_cap, forbidden_tile`;
+        const result = mission.computeEV(params, stats);
+        if (!result) {
+            return `Error: unknown type '${params.type}'. Valid: stack, preferred_tile, blacklist, reward_cap, forbidden_tile`;
         }
 
+        const { ev, guadagnoMissione, guadagnoStandard } = result;
         const evRounded = isFinite(ev) ? parseFloat(ev.toFixed(2)) : -999;
-        if (!isFinite(ev) || ev <= 0) {
-            raccomandazione = `RIFIUTA (EV = ${evRounded})`;
-        } else {
-            raccomandazione = `ACCETTA (EV = +${evRounded})`;
-        }
+        const raccomandazione = (!isFinite(ev) || ev <= 0)
+            ? `RIFIUTA (EV = ${evRounded})`
+            : `ACCETTA (EV = +${evRounded})`;
 
         return JSON.stringify({
             ev: evRounded,
             guadagno_con_missione: isFinite(guadagnoMissione) ? parseFloat(guadagnoMissione.toFixed(2)) : 0,
             guadagno_standard: parseFloat(guadagnoStandard.toFixed(2)),
-            punti_al_secondo_attuale: parseFloat(pps.toFixed(3)),
+            punti_al_secondo_attuale: parseFloat(stats.pps.toFixed(3)),
             raccomandazione,
         });
     } catch (e) {

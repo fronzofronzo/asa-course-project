@@ -345,13 +345,8 @@ agentLoop();
 setInterval(() => {
     agent.beliefs.log();
     const c = agent.beliefs.missionConstraints;
-    const hasMission = c.stack.min !== null || c.stack.max !== null
-        || c.preferredDeliveryTiles !== null
-        || c.blacklistedDeliveryTiles.size > 0
-        || c.rewardCap !== null
-        || c.forbiddenTiles.size > 0;
-    if (hasMission) {
-        log(`[MISSION_CONSTRAINTS] stack={min:${c.stack.min},max:${c.stack.max}} | preferredTiles=${c.preferredDeliveryTiles ? JSON.stringify(c.preferredDeliveryTiles) + `(x${c.preferredDeliveryMultiplier})` : 'none'} | blacklist=[${[...c.blacklistedDeliveryTiles].join(',')}] | rewardCap=${c.rewardCap ?? 'none'} | forbidden=[${[...c.forbiddenTiles].join(',')}]`);
+    if (c.hasMission()) {
+        log(`[MISSION_CONSTRAINTS] stack={min:${c.stack.min},max:${c.stack.max}} | preferredTiles=${c.preferred.tiles ? JSON.stringify(c.preferred.tiles) + `(x${c.preferred.multiplier})` : 'none'} | blacklist=[${[...c.blacklist.tiles].join(',')}] | rewardCap=${c.rewardCap.cap ?? 'none'} | forbidden=[${[...c.forbidden.tiles].join(',')}]`);
     } else {
         log('[MISSION_CONSTRAINTS] none active — standard play');
     }
