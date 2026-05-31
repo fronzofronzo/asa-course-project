@@ -3,6 +3,7 @@ import path from 'path';
 
 const LOG_DIR = './logs';
 const LOG_FILE = path.join(LOG_DIR, 'agent.log');
+const LLM_LOG_FILE = path.join(LOG_DIR, 'llm.log');
 
 function ensureLogDir() {
     if (!fs.existsSync(LOG_DIR)) {
@@ -18,4 +19,12 @@ function log(message) {
     console.log(logEntry);
 }
 
-export { log };
+function logLLM(message) {
+    ensureLogDir();
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] ${message}\n`;
+    fs.appendFileSync(LLM_LOG_FILE, logEntry, 'utf8');
+    console.log(logEntry);
+}
+
+export { log, logLLM };

@@ -1,4 +1,5 @@
 import { bfsDist, computeSpawnHeat} from './utils.js';
+import { MissionConstraints } from './llm/constraints/MissionConstraints.js';
 import { writeFileSync } from 'fs';
 
 const LAMBDA = 0.3;
@@ -17,6 +18,8 @@ class BeliefSet {
         };
         this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
         this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
+        this.tileUtilities = new Map(); // "x,y" → number (LLM-injected tile goals)
+        this.missionConstraints = new MissionConstraints();
     }
 
     /**
