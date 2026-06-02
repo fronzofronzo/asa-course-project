@@ -3,6 +3,7 @@ import { PreferredDeliveryConstraint } from './PreferredDeliveryConstraint.js';
 import { BlacklistConstraint }          from './BlacklistConstraint.js';
 import { RewardCapConstraint }          from './RewardCapConstraint.js';
 import { ForbiddenTileConstraint }      from './ForbiddenTileConstraint.js';
+import { RedLightConstraint }           from './RedLightConstraint.js';
 
 /**
  * Registry and orchestrator for all active mission constraints.
@@ -17,9 +18,15 @@ export class MissionConstraints {
         this.blacklist = new BlacklistConstraint();
         this.rewardCap = new RewardCapConstraint();
         this.forbidden = new ForbiddenTileConstraint();
+        this.redLight  = new RedLightConstraint();
         /** @type {import('./Constraint.js').Constraint[]} */
-        this._all = [this.stack, this.preferred, this.blacklist, this.rewardCap, this.forbidden];
+        this._all = [this.stack, this.preferred, this.blacklist, this.rewardCap, this.forbidden, this.redLight];
     }
+
+    /**
+     * @returns {boolean} true if movement is currently frozen by a red light constraint.
+     */
+    isMovementFrozen() { return this.redLight.frozen; }
 
     /**
      * @returns {boolean} true if at least one constraint is active.

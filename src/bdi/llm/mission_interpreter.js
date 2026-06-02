@@ -163,6 +163,15 @@ function addForbiddenTile(input, beliefs) {
     }
 }
 
+function setMovementFreeze(input, beliefs) {
+    const val = input.trim().toLowerCase().replace(/^["']+|["']+$/g, '')
+    if (!['true', 'false'].includes(val)) return 'Error: input must be "true" (red light / stop) or "false" (green light / go)'
+    beliefs.missionConstraints.redLight.set(val === 'true')
+    return val === 'true'
+        ? 'Red light active: movement frozen. Agent will not move until green light.'
+        : 'Green light: movement resumed. Agent is free to act.'
+}
+
 function getMissionState(beliefs) {
     const c = beliefs.missionConstraints
     return JSON.stringify({ ...c.toJSON(), hasMission: c.hasMission() })
@@ -186,7 +195,7 @@ function evaluateMission(input, beliefs, getGameStats) {
 
         const result = beliefs.missionConstraints.computeEV(params, normalizedStats)
         if (!result) {
-            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile`
+            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile | red_light`
         }
 
         const { ev, guadagnoMissione: missionGain, guadagnoStandard: standardGain } = result
@@ -198,6 +207,7 @@ function evaluateMission(input, beliefs, getGameStats) {
             blacklist:      'Blacklisted tile yields 0 pts — always reject',
             reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap will be skipped`,
             forbidden_tile: `Avoid tile: saves ~${((params.penalty ?? 50) * (params.prob_enter ?? 0.3)).toFixed(1)} penalty pts, costs ~${(DECAY * normalizedStats.avgReward * (params.extra_steps ?? 2)).toFixed(1)} pts in detours`,
+            red_light:      `Stop all movement. Bonus on compliance: ${params.bonus ?? 10000} pts. EV = full bonus (zero opportunity cost assumed).`,
         }
 
         const rec = ev > 0
@@ -242,6 +252,7 @@ INTERMEDIATE MISSION EVALUATION:
    - {"type":"blacklist"}                                  — EV always -Infinity (always reject)
    - {"type":"reward_cap", "cap":10}                       — skip high-reward parcels
    - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
+   - {"type":"red_light", "bonus":10000}
 
 INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
 6. set_stack_requirement — Input: {"min":N or null, "max":N or null}
@@ -250,8 +261,9 @@ INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
 8. blacklist_delivery_tile — Input: {"x":N,"y":N} — Never deliver here
 9. set_reward_cap — Input: number string, e.g. "10.5" — Skip parcels above this reward
 10. add_forbidden_tile — Input: {"x":N,"y":N} — Pathfinding avoids this tile
-11. get_mission_state — Input: "" — Returns current constraints snapshot
-12. reset_mission — Input: "" — Clears all constraints
+11. set_movement_freeze — Input: "true" or "false" — "true" = red light (freeze all movement), "false" = green light (resume movement)
+12. get_mission_state — Input: "" — Returns current constraints snapshot
+13. reset_mission — Input: "" — Clears all constraints
 
 == MISSION HANDLING RULES ==
 
@@ -275,6 +287,11 @@ RULE 5 — Stack missions:
   "at most N" → set_stack_requirement({"min":null,"max":N})
 
 RULE 6 — Utility value for set_tile_utility MUST equal the exact numerical reward stated (e.g. "+10pts" → utility 10).
+
+RULE 7 — RED LIGHT / STOP missions ("stop", "freeze", "don't move", "wait until I say go"):
+  Step 1: evaluate_mission({"type":"red_light","bonus":<N>}) where N is the stated bonus (default 10000).
+  Step 2: EV is always positive — call set_movement_freeze("true"), then Final Answer "accepted".
+  When a follow-up "green light" / "go" / "resume" message arrives: call set_movement_freeze("false").
 
 == OUTPUT FORMAT — choose exactly one per message ==
 
@@ -311,6 +328,7 @@ export async function interpretMission(senderName, msg, beliefs, getState, reply
         blacklist_delivery_tile:       (input)  => blacklistDeliveryTile(input, beliefs),
         set_reward_cap:                (input)  => setRewardCap(input, beliefs),
         add_forbidden_tile:            (input)  => addForbiddenTile(input, beliefs),
+        set_movement_freeze:           (input)  => setMovementFreeze(input, beliefs),
         get_mission_state:             (_input) => getMissionState(beliefs),
         reset_mission:                 (_input) => resetMission(beliefs),
     }

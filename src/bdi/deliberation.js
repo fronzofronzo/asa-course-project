@@ -218,7 +218,15 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
  * @returns {Promise<boolean>} true on arrival, false if stuck
  */
 async function go_to(target, agent) {
+    if (agent.beliefs.missionConstraints?.isMovementFrozen?.()) {
+        console.warn('[go_to] Movement frozen (red light) — aborting navigation');
+        return false;
+    }
     while (true) {
+        if (agent.beliefs.missionConstraints?.isMovementFrozen?.()) {
+            console.warn('[go_to] Movement frozen mid-path (red light) — stopping');
+            return false;
+        }
         const path = computePath(
             { x: agent.x, y: agent.y },
             target,
@@ -256,6 +264,10 @@ async function go_to(target, agent) {
  * @returns {Promise<'arrived'|'moved'|'stuck'>}
  */
 async function stepToward(target, agent) {
+    if (agent.beliefs.missionConstraints?.isMovementFrozen?.()) {
+        console.warn('[stepToward] Movement frozen (red light) — aborting step');
+        return 'stuck';
+    }
     const from = { x: agent.x, y: agent.y };
     const to = target;
     

@@ -101,9 +101,10 @@ socket.onSensing(async ({ agents, parcels }) => {
         gameStats.avgReward = updateRolling(gameStats.avgReward, avg);
     }
 
-    // Autonomous game loop — only when a mission is active
+    // Autonomous game loop — only when a mission is active and movement not frozen
     sensingTick++;
     if (!hasMission()) return;
+    if (mission.isMovementFrozen()) return;
     if (sensingTick % AUTONOMOUS_EVERY !== 0) return;
     if (busy) return;
 
@@ -197,6 +198,7 @@ async function getMyPosition() {
 
 async function move(direction) {
     console.log("---- MOVE ----");
+    if (mission.isMovementFrozen()) return 'Red light active: movement is frozen. Wait for green light command.';
     const normalized = direction.trim().toLowerCase();
     if (!["up", "down", "left", "right"].includes(normalized)) {
         return `Error: invalid direction '${direction}'. Valid: up, down, left, right.`;
@@ -277,6 +279,7 @@ function bfsPath(sx, sy, tx, ty) {
 // Navigate to (x,y) — uses BFS on real map when available, greedy fallback otherwise
 async function navigateTo(args) {
     console.log("---- NAVIGATE TO ----");
+    if (mission.isMovementFrozen()) return 'Red light active: movement is frozen. Wait for green light command.';
     let tx, ty;
     try {
         const parsed = JSON.parse(args);
@@ -457,6 +460,16 @@ function addForbiddenTile(input) {
     }
 }
 
+function setMovementFreeze(input) {
+    console.log("---- SET MOVEMENT FREEZE ----");
+    const val = input.trim().toLowerCase().replace(/^["']+|["']+$/g, '');
+    if (!['true', 'false'].includes(val)) return 'Error: input must be "true" (red light) or "false" (green light).';
+    mission.redLight.set(val === 'true');
+    return val === 'true'
+        ? 'Red light active: movement frozen. Agent will not move or act until green light.'
+        : 'Green light: movement resumed. Agent is free to move and act.';
+}
+
 function getMissionState() {
     console.log("---- GET MISSION STATE ----");
     return JSON.stringify({ ...mission.toJSON(), hasMission: mission.hasMission() });
@@ -483,7 +496,7 @@ function evaluateMission(input) {
 
         const result = mission.computeEV(params, stats);
         if (!result) {
-            return `Error: unknown type '${params.type}'. Valid: stack, preferred_tile, blacklist, reward_cap, forbidden_tile`;
+            return `Error: unknown type '${params.type}'. Valid: stack, preferred_tile, blacklist, reward_cap, forbidden_tile, red_light`;
         }
 
         const { ev, guadagnoMissione, guadagnoStandard } = result;
@@ -523,6 +536,7 @@ const TOOLS = {
     blacklist_delivery_tile: blacklistDeliveryTile,
     set_reward_cap: setRewardCap,
     add_forbidden_tile: addForbiddenTile,
+    set_movement_freeze: setMovementFreeze,
     get_mission_state: getMissionState,
     reset_mission: resetMission,
 };
@@ -590,12 +604,14 @@ Use these when you receive a special mission via [MISSION RECEIVED].
     {"type":"blacklist"}
     {"type":"reward_cap", "cap":10}
     {"type":"forbidden_tile", "extra_steps":3, "penalty":50, "prob_enter":0.2}
+    {"type":"red_light", "bonus":10000}
 
 - set_stack_requirement(N): hold until carrying N parcels, then deliver (for stack missions)
 - set_preferred_delivery_tiles({"tiles":[{"x":1,"y":2}], "multiplier":5}): only deliver at these tiles
 - blacklist_delivery_tile({"x":1,"y":2}): never deliver at this tile
 - set_reward_cap(10): skip parcels with reward above this value
 - add_forbidden_tile({"x":4,"y":7}): route around this tile in navigation
+- set_movement_freeze("true"|"false"): "true" = red light (freeze all movement/actions), "false" = green light (resume)
 - get_mission_state(): show all active constraints
 - reset_mission(): clear all constraints
 
@@ -617,6 +633,7 @@ Use these when you receive a special mission via [MISSION RECEIVED].
 - After accepting a stack mission: put_down will automatically refuse until stack is full
 - After accepting a preferred_tile mission: ALWAYS call get_delivery_tiles immediately after set_preferred_delivery_tiles. If ALL returned tiles have "preferred": false, the mission coordinates do not exist on this map — call reset_mission then give Final Answer "Mission rejected: preferred tiles (X,Y) do not exist on this map". Only keep the mission if at least one tile has "preferred": true
 - reset_mission() cancels all active constraints and returns to standard play
+- For red_light missions: call evaluate_mission({"type":"red_light","bonus":10000}), then set_movement_freeze("true"). When you receive a "green light / go" message: call set_movement_freeze("false") to resume
 
 == AUTONOMOUS TURN (when you get "Autonomous turn: ...") ==
 - Call get_world_state to see current state and active mission
