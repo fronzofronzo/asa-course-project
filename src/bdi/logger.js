@@ -11,6 +11,9 @@ function ensureLogDir() {
     }
 }
 
+ensureLogDir();
+fs.writeFileSync(LLM_LOG_FILE, '', 'utf8');
+
 function log(message) {
     ensureLogDir();
     const timestamp = new Date().toISOString();
