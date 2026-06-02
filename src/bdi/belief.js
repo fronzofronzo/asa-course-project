@@ -16,8 +16,12 @@ class BeliefSet {
             exitDirs: new Map(),   // key: `${x},${y}` → Set of allowed exit directions ('up'|'down'|'left'|'right'); absent = all directions allowed
             spawnHeat: new Map(),  // key: `${x},${y}` → heat value (0-1)
         };
-        this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
-        this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
+        this.parcels = new Map();    // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
+        this.agents  = new Map();    // id → { id, name, teamId, teamName, x, y, score, lastSeen }
+        /** Persistent registry of agents on the same team. Never expires — survives out-of-range. */
+        this.teammates = new Map();  // id → { id, name, teamId, teamName, lastKnownX, lastKnownY }
+        /** Own teamId — set when onYou fires, used to identify teammates. */
+        this.myTeamId = null;
         this.tileUtilities = new Map(); // "x,y" → number (LLM-injected tile goals)
         this.missionConstraints = new MissionConstraints();
     }
@@ -67,11 +71,24 @@ class BeliefSet {
             this.agents.set(a.id, {
                 id: a.id,
                 name: a.name,
+                teamId: a.teamId ?? null,
+                teamName: a.teamName ?? null,
                 x: a.x,
                 y: a.y,
                 score: a.score,
                 lastSeen: now,
             });
+            // Persist teammate identity — survives out-of-range
+            if (this.myTeamId && a.teamId === this.myTeamId) {
+                this.teammates.set(a.id, {
+                    id: a.id,
+                    name: a.name,
+                    teamId: a.teamId,
+                    teamName: a.teamName ?? null,
+                    lastKnownX: a.x,
+                    lastKnownY: a.y,
+                });
+            }
         }
 
         // keep recently-seen agents for opponent proximity calculation in uncertainty estimation

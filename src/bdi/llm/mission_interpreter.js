@@ -50,8 +50,16 @@ function getAgentState(beliefs, getState) {
     try {
         const { x, y, score } = getState()
         if (x === null) return 'Error: agent position not available yet'
+        const teammates = [...beliefs.teammates.values()].map(t => ({
+            id: t.id,
+            name: t.name,
+            lastKnownX: t.lastKnownX,
+            lastKnownY: t.lastKnownY,
+        }))
         return JSON.stringify({
             x, y, score,
+            teamId: beliefs.myTeamId ?? null,
+            teammates,  // always present — use these IDs for L3 coordination missions
             mapInfo: {
                 deliveryTilesCount: beliefs.map.deliveryTiles.length,
                 spawnTilesCount: beliefs.map.spawnTiles.length,
@@ -163,6 +171,112 @@ function addForbiddenTile(input, beliefs) {
     }
 }
 
+// ─── Coordination tools ───────────────────────────────────────────────────────
+
+function getNearbyAgents(beliefs, getState) {
+    try {
+        const { x, y } = getState()
+        if (x === null) return 'Error: agent position not available yet'
+
+        if (beliefs.teammates.size === 0) {
+            return 'No teammates known yet — agents have not been in sensing range of each other. ' +
+                   'Accept the mission anyway if EV > 0; the partner ID will be available once they meet.'
+        }
+
+        // Build result from persistent teammates, enriched with live position if in range
+        const livePositions = new Map(
+            [...beliefs.agents.values()].map(a => [a.id, { x: a.x, y: a.y, inRange: true }])
+        )
+
+        return JSON.stringify(
+            [...beliefs.teammates.values()].map(t => {
+                const live = livePositions.get(t.id)
+                const tx   = live ? live.x : t.lastKnownX
+                const ty   = live ? live.y : t.lastKnownY
+                return {
+                    id:         t.id,
+                    name:       t.name,
+                    teamId:     t.teamId,
+                    x:          tx,
+                    y:          ty,
+                    inRange:    live ? true : false,
+                    dist:       tx != null
+                        ? Math.abs(Math.round(tx) - Math.round(x)) + Math.abs(Math.round(ty) - Math.round(y))
+                        : null,
+                }
+            })
+        )
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
+function sendToAgent(input, socket) {
+    try {
+        const { agentId, message } = JSON.parse(input)
+        if (!agentId || typeof message !== 'string') {
+            return 'Error: expected JSON {"agentId":"...","message":"..."}'
+        }
+        socket.emitSay(agentId, message)
+        return `Message sent to agent ${agentId}: "${message}"`
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
+function setRendezvous(input, beliefs, socket) {
+    try {
+        const { x, y, radius, bonus, partnerId } = JSON.parse(input)
+        if (typeof x !== 'number' || typeof y !== 'number') {
+            return 'Error: x and y must be numbers. Expected: {"x":N,"y":N,"radius":3,"bonus":500,"partnerId":"..."}'
+        }
+        const cx = Math.round(x), cy = Math.round(y)
+        const r  = radius ?? 3
+        const b  = bonus  ?? 500
+        beliefs.missionConstraints.rendezvous.set({ x: cx, y: cy }, r, b, partnerId ?? null)
+        // Inject GOTO goal into BDI tileUtilities
+        beliefs.tileUtilities.set(`${cx},${cy}`, b)
+        // Broadcast to partner if ID provided
+        if (partnerId) {
+            const payload = `${cx},${cy},${r},${b}`
+            socket.emitSay(partnerId, `[COORD:RENDEZVOUS_MISSION] ${payload}`)
+        }
+        logLLM(`[MissionInterpreter] Rendezvous set: center=(${cx},${cy}) r=${r} bonus=${b} partner=${partnerId}`)
+        return `Rendezvous activated: navigate to neighborhood of (${cx},${cy}) within radius ${r}. BDI will head there automatically.`
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
+function setHandoffRole(input, beliefs, socket) {
+    try {
+        const { role, parcelId, partnerId, handoffX, handoffY, bonus } = JSON.parse(input)
+        if (role !== 'pickup' && role !== 'delivery') {
+            return 'Error: role must be "pickup" or "delivery"'
+        }
+        if (typeof handoffX !== 'number' || typeof handoffY !== 'number') {
+            return 'Error: handoffX and handoffY must be numbers'
+        }
+        const hx = Math.round(handoffX), hy = Math.round(handoffY)
+        const b  = bonus ?? 200
+        beliefs.missionConstraints.handoff.set(role, parcelId ?? null, partnerId ?? null, { x: hx, y: hy }, b)
+        // Inject handoff tile as nav goal for delivery role
+        if (role === 'delivery') {
+            beliefs.tileUtilities.set(`${hx},${hy}`, b)
+        }
+        // Tell partner their complementary role
+        if (partnerId) {
+            const partnerRole = role === 'pickup' ? 'delivery' : 'pickup'
+            const payload = `${partnerRole},${parcelId ?? 'null'},${hx},${hy},${b}`
+            socket.emitSay(partnerId, `[COORD:HANDOFF_MISSION] ${payload}`)
+        }
+        logLLM(`[MissionInterpreter] Handoff set: role=${role} parcel=${parcelId} tile=(${hx},${hy}) partner=${partnerId}`)
+        return `Handoff role="${role}" activated. Tile=(${hx},${hy}). ${role === 'pickup' ? 'Pick up parcel and drop at handoff tile.' : 'Navigate to handoff tile, pick up, and deliver.'}`
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
 function setMovementFreeze(input, beliefs) {
     const val = input.trim().toLowerCase().replace(/^["']+|["']+$/g, '')
     if (!['true', 'false'].includes(val)) return 'Error: input must be "true" (red light / stop) or "false" (green light / go)'
@@ -195,7 +309,7 @@ function evaluateMission(input, beliefs, getGameStats) {
 
         const result = beliefs.missionConstraints.computeEV(params, normalizedStats)
         if (!result) {
-            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile | red_light`
+            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile | red_light | rendezvous | handoff`
         }
 
         const { ev, guadagnoMissione: missionGain, guadagnoStandard: standardGain } = result
@@ -208,6 +322,8 @@ function evaluateMission(input, beliefs, getGameStats) {
             reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap will be skipped`,
             forbidden_tile: `Avoid tile: saves ~${((params.penalty ?? 50) * (params.prob_enter ?? 0.3)).toFixed(1)} penalty pts, costs ~${(DECAY * normalizedStats.avgReward * (params.extra_steps ?? 2)).toFixed(1)} pts in detours`,
             red_light:      `Stop all movement. Bonus on compliance: ${params.bonus ?? 10000} pts. EV = full bonus (zero opportunity cost assumed).`,
+            rendezvous:     `Meet at target. Bonus: ${params.bonus ?? 500} pts. Estimated detour: ${params.estimated_steps ?? 10} steps each way.`,
+            handoff:        `Parcel handoff between agents. Bonus: ${params.bonus ?? 200} pts. Extra steps to handoff tile: ${params.extra_steps ?? 5}.`,
         }
 
         const rec = ev > 0
@@ -239,7 +355,7 @@ TYPE 2 — INTERMEDIATE: Persistent strategy change. Requires evaluate_mission t
 == TOOLS ==
 
 STANDARD:
-1. get_agent_state — Input: "" — Returns: {x, y, score, mapInfo}
+1. get_agent_state — Input: "" — Returns: {x, y, score, teamId, teammates:[{id,name,x,y}], mapInfo} — teammates list is persistent (survives out-of-range); use it for all L3 coordination
 2. calculate — Input: math expression string — Returns: computed result
 3. set_tile_utility — Input: {"x":N,"y":N,"utility":N} — Directs BDI to go to tile (positive utility only)
 4. reply_to_sender — Input: plain text string — Sends reply to mission sender
@@ -253,6 +369,8 @@ INTERMEDIATE MISSION EVALUATION:
    - {"type":"reward_cap", "cap":10}                       — skip high-reward parcels
    - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
    - {"type":"red_light", "bonus":10000}
+   - {"type":"rendezvous", "bonus":500, "estimated_steps":10}
+   - {"type":"handoff", "bonus":200, "extra_steps":5}
 
 INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
 6. set_stack_requirement — Input: {"min":N or null, "max":N or null}
@@ -264,6 +382,12 @@ INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
 11. set_movement_freeze — Input: "true" or "false" — "true" = red light (freeze all movement), "false" = green light (resume movement)
 12. get_mission_state — Input: "" — Returns current constraints snapshot
 13. reset_mission — Input: "" — Clears all constraints
+
+COORDINATION TOOLS (Level 3 — multi-agent missions):
+14. get_nearby_agents — Input: "" — Returns [{id, name, x, y, dist}] sorted by distance — ALWAYS call this first for coordination missions to get partner agent ID
+15. send_to_agent — Input: {"agentId":"...","message":"..."} — Send a free-text message to a specific agent
+16. set_rendezvous — Input: {"x":N,"y":N,"radius":3,"bonus":500,"partnerId":"..."} — Activates rendezvous: BDI navigates to (x,y), freezes on arrival, resumes when partner also arrives. Broadcasts to partner automatically.
+17. set_handoff_role — Input: {"role":"pickup"|"delivery","parcelId":"..."|null,"partnerId":"...","handoffX":N,"handoffY":N,"bonus":200} — Configure parcel handoff. Pickup agent collects parcel and drops at handoff tile. Delivery agent navigates there and delivers. Broadcasts role to partner automatically.
 
 == MISSION HANDLING RULES ==
 
@@ -293,6 +417,30 @@ RULE 7 — RED LIGHT / STOP missions ("stop", "freeze", "don't move", "wait unti
   Step 2: EV is always positive — call set_movement_freeze("true"), then Final Answer "accepted".
   When a follow-up "green light" / "go" / "resume" message arrives: call set_movement_freeze("false").
 
+RULE 8 — RENDEZVOUS missions ("move both agents to neighborhood of (x,y)", "meet at (x,y)"):
+  Step 1: get_agent_state — read "teammates" field directly. NEVER call get_nearby_agents for this.
+  Step 2: evaluate_mission({"type":"rendezvous","bonus":<N>,"estimated_steps":<D>}) where D ≈ distance to target.
+  Step 3a: EV > 0 AND teammates non-empty → set_rendezvous({"x":...,"y":...,"radius":3,"bonus":<N>,"partnerId":"<teammates[0].id>"}).
+  Step 3b: EV > 0 AND teammates empty → set_rendezvous with partnerId=null; reply "accepted, awaiting teammate contact".
+  Step 3c: EV ≤ 0 → reject.
+  Agent auto-navigates to center. Freezes on arrival. Resumes when partner signals (handled automatically).
+
+RULE 9 — HANDOFF missions ("agent A picks up, agent B delivers", "pass parcel to teammate"):
+  Step 1: get_agent_state — read "teammates" field directly. NEVER call get_nearby_agents for this.
+  Step 2: evaluate_mission({"type":"handoff","bonus":<N>,"extra_steps":5}).
+  Step 3a: EV > 0 AND teammates non-empty → decide role ('pickup' if closer to parcels, else 'delivery').
+    set_handoff_role({"role":"pickup"|"delivery","parcelId":null,"partnerId":"<teammates[0].id>","handoffX":<N>,"handoffY":<N>,"bonus":<N>}).
+    Use center of map as handoffX/Y if positions unknown.
+  Step 3b: EV > 0 AND teammates empty → set_handoff_role with partnerId=null; reply "accepted, awaiting teammate contact".
+  Step 3c: EV ≤ 0 → reject.
+  Partner's complementary role is broadcast automatically.
+
+RULE 10 — COLLECTIVE RED LIGHT ("all agents to odd row", "all agents must X"):
+  Step 1: evaluate_mission({"type":"red_light","bonus":<N>}).
+  Step 2: call set_tile_utility to navigate to nearest odd-row tile (y % 2 === 1).
+  Step 3: call set_movement_freeze("true") after arrival (or immediately if mission says stop first).
+  Step 4: if teammates known → send_to_agent each partner with the mission text so they handle it too.
+
 == OUTPUT FORMAT — choose exactly one per message ==
 
 FORMAT A — use a tool:
@@ -309,7 +457,7 @@ Never output Action and Final Answer in the same message. Never write "Action: N
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 
-export async function interpretMission(senderName, msg, beliefs, getState, replyFn, getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 })) {
+export async function interpretMission(senderName, msg, beliefs, getState, replyFn, getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 }), socket = null) {
     if (!client) {
         logLLM('[MissionInterpreter] No LLM client — skipping mission interpretation')
         return
@@ -329,6 +477,11 @@ export async function interpretMission(senderName, msg, beliefs, getState, reply
         set_reward_cap:                (input)  => setRewardCap(input, beliefs),
         add_forbidden_tile:            (input)  => addForbiddenTile(input, beliefs),
         set_movement_freeze:           (input)  => setMovementFreeze(input, beliefs),
+        // L3 coordination tools (socket required)
+        get_nearby_agents:             (_input) => getNearbyAgents(beliefs, getState),
+        send_to_agent:                 (input)  => socket ? sendToAgent(input, socket) : 'Error: no socket available',
+        set_rendezvous:                (input)  => socket ? setRendezvous(input, beliefs, socket) : 'Error: no socket available',
+        set_handoff_role:              (input)  => socket ? setHandoffRole(input, beliefs, socket) : 'Error: no socket available',
         get_mission_state:             (_input) => getMissionState(beliefs),
         reset_mission:                 (_input) => resetMission(beliefs),
     }

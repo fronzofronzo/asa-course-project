@@ -4,6 +4,7 @@ import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } 
 import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
+import { tryHandleCoordMessage } from './llm/coordination_protocol.js';
 import { log } from './logger.js';
 
 
@@ -81,7 +82,7 @@ agent.socket.onConfig((config) => {
         console.log(`[CONFIG] avgReward from server: ${agent.gameStats.avgReward}`);
     }
 })
-agent.socket.onYou(({id, name, x, y, score, penalty}) => {
+agent.socket.onYou(({id, name, x, y, score, penalty, teamId, teamName}) => {
     const delta = score - agent.gameStats.lastScore;
     if (delta > 0) {
         agent.gameStats.deliveries.push({ reward: delta, timestamp: Date.now() });
@@ -89,8 +90,21 @@ agent.socket.onYou(({id, name, x, y, score, penalty}) => {
     }
     agent.gameStats.lastScore = score;
     agent.updateInformation(id, name, x, y, score);
+    // Persist own team identity so updateAgents can match teammates
+    if (teamId && !agent.beliefs.myTeamId) {
+        agent.beliefs.myTeamId = teamId;
+        log(`[TEAM] teamId=${teamId} teamName=${teamName ?? 'n/a'}`);
+    }
 })
 agent.socket.onSensing(({ agents, parcels }) => {
+    // Fallback: if onYou didn't carry teamId, grab it from our own entry in the sensing list
+    if (!agent.beliefs.myTeamId && agent.id) {
+        const self = (agents ?? []).find(a => a.id === agent.id);
+        if (self?.teamId) {
+            agent.beliefs.myTeamId = self.teamId;
+            log(`[TEAM] teamId from sensing fallback: ${self.teamId}`);
+        }
+    }
     agent.beliefs.updateBeliefs({ agents, parcels });
     if (agent.x !== null) {
         agent.beliefs.updateParcelUncertainty({ x: agent.x, y: agent.y });
@@ -127,7 +141,8 @@ async function drainMissions() {
                         movementDuration: agent.gameConfig?.player?.movement_duration ?? 500,
                         pointsPerSecond: agent.score / Math.max(1, elapsed),
                     };
-                }
+                },
+                agent.socket
             );
         } finally {
             llmBusy = false;
@@ -137,6 +152,8 @@ async function drainMissions() {
 
 agent.socket.onMsg(async (senderId, name, msg, ack) => {
     console.log(`\n[MISSION] Message from ${name}: ${msg}`);
+    // Coordination protocol messages are handled immediately without LLM
+    if (tryHandleCoordMessage(msg, senderId, agent.beliefs, agent.socket, agent.id)) return;
     // Works for both emitAsk (ack replies to caller) and emitSay (emitSay sends a new message)
     const replyFn = (message) => {
         if (ack) try { ack(message); } catch {}
@@ -160,6 +177,53 @@ async function agentLoop() {
         const agentPos = { x: agent.x, y: agent.y };
         const carriedCount = agent.carriedParcels.length;
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
+
+        // ── Rendezvous arrival detection ──────────────────────────────────────
+        const rv = agent.beliefs.missionConstraints?.rendezvous;
+        if (rv?.isActive() && !rv.myArrived && rv.checkInRange(agentPos)) {
+            const wasNew = rv.markMyArrival();
+            if (wasNew) {
+                log(`[RENDEZVOUS] Arrived within radius ${rv.radius} of (${rv.center.x},${rv.center.y})`);
+                // Clear the GOTO tile so BDI stops navigating toward center
+                agent.beliefs.tileUtilities.delete(`${rv.center.x},${rv.center.y}`);
+                // Signal partner
+                if (rv.partnerId) {
+                    agent.socket.emitSay(rv.partnerId, '[COORD:RENDEZVOUS_ARRIVED]');
+                    log(`[RENDEZVOUS] Signalled partner ${rv.partnerId}`);
+                }
+                // Freeze until teammate also arrives (isMovementFrozen() now returns true)
+                if (!rv.isFulfilled()) {
+                    log('[RENDEZVOUS] Waiting for teammate...');
+                }
+            }
+        }
+
+        // ── Handoff pickup: once carrying, inject handoffTile as GOTO target ────
+        if (hf?.isActive() && hf.role === 'pickup' && !hf.dropped && hf.handoffTile && carriedCount > 0) {
+            const key = `${hf.handoffTile.x},${hf.handoffTile.y}`;
+            if (!agent.beliefs.tileUtilities.has(key)) {
+                agent.beliefs.tileUtilities.set(key, hf.bonus);
+                log(`[HANDOFF] Carrying parcels — GOTO handoff tile (${hf.handoffTile.x},${hf.handoffTile.y})`);
+            }
+        }
+
+        // ── Handoff: drop parcel at handoff tile (non-delivery), notify partner ─
+        const hf = agent.beliefs.missionConstraints?.handoff;
+        if (hf?.isActive() && hf.role === 'pickup' && !hf.dropped && hf.handoffTile) {
+            const onHandoff = Number.isInteger(agent.x) && Number.isInteger(agent.y)
+                           && agent.x === hf.handoffTile.x
+                           && agent.y === hf.handoffTile.y
+                           && agent.carriedParcels.length > 0;
+            if (onHandoff) {
+                const dropped = await agent.socket.emitPutdown();
+                hf.dropped = true;
+                log(`[HANDOFF] Dropped ${dropped?.length ?? 0} parcel(s) at (${hf.handoffTile.x},${hf.handoffTile.y}) for teammate pickup`);
+                if (hf.partnerId) {
+                    agent.socket.emitSay(hf.partnerId, `[COORD:HANDOFF_READY] ${hf.handoffTile.x},${hf.handoffTile.y}`);
+                }
+                hf.role = null; // pickup side done
+            }
+        }
 
         // Always compute desires so shouldDeliver has accurate parcel count
         const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD);
@@ -195,6 +259,17 @@ async function agentLoop() {
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
             if (onDelivery) {
+                // Handoff pickup role: delivery tiles are blocked — agent must drop at handoffTile instead
+                const putdownBlock = agent.beliefs.missionConstraints?.checkPutdown(
+                    `${Math.round(agent.x)},${Math.round(agent.y)}`,
+                    agent.carriedParcels,
+                    { me: agent, world: agent.beliefs }
+                );
+                if (putdownBlock) {
+                    log(`[DELIVER] Blocked: ${putdownBlock}`);
+                    agent.intention = null; // re-deliberate — handoff tileUtility will redirect
+                    continue;
+                }
                 const stackMin = agent.beliefs.missionConstraints?.stack?.min ?? null;
                 if (stackMin !== null && carriedCount < stackMin) {
                     // stack not full — only deliver if no parcels left to collect (deadlock prevention)
