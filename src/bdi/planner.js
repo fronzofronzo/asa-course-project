@@ -153,12 +153,19 @@ function computeBestSpawnTile(agent, visitedSpawns) {
         const d = bfsDistDirected(agentPos, tile, walkable, exitDirs);
         if (d === Infinity) continue;
         const distScore = 1 / (d + 1);
-        const agentPenalty = [...agent.beliefs.agents.values()].filter(a => Math.abs(a.x - tile.x) + Math.abs(a.y - tile.y) <= 2).length * 0.5;
-        const lastVisit = visitedSpawns.get(`${tile.x},${tile.y}`) || 0;
-        const recencyPenalty = Math.max(0, 1 - (Date.now() - lastVisit) / 10000); // decays over 10s
         const heatScore = agent.beliefs.map.spawnHeat.get(`${tile.x},${tile.y}`) || 0;
-        const score = distScore - agentPenalty - recencyPenalty + heatScore;
-        log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, agentPenalty=${agentPenalty.toFixed(3)}, recencyPenalty=${recencyPenalty.toFixed(3)}, heatScore=${heatScore.toFixed(3)}), lastVisit=${lastVisit ? new Date(lastVisit).toISOString() : 'never'}, nearbyAgents=${agentPenalty / 0.5}`);
+
+        // Multiplicative factors: 0 = fully suppressed, 1 = no penalty
+        const lastVisit = visitedSpawns.get(`${tile.x},${tile.y}`) || 0;
+        const elapsed = lastVisit === 0 ? Infinity : Date.now() - lastVisit;
+        const recencyFactor = Math.min(1, elapsed / 30000); // 0 just visited → 1 after 30s
+
+        const nearbyAgents = [...agent.beliefs.agents.values()]
+            .filter(a => Math.abs(a.x - tile.x) + Math.abs(a.y - tile.y) <= 2).length;
+        const agentFactor = Math.max(0, 1 - nearbyAgents * 0.4); // 0 at 3+ agents
+
+        const score = (distScore + heatScore) * recencyFactor * agentFactor;
+        log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, heat=${heatScore.toFixed(3)}, recencyFactor=${recencyFactor.toFixed(3)}, agentFactor=${agentFactor.toFixed(3)}, nearbyAgents=${nearbyAgents})`);
         if (score > bestScore) { bestScore = score; best = tile; }
     }
     return best;
