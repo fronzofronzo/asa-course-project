@@ -137,7 +137,14 @@ async function drainMissions() {
     }
 }
 
+const MISSION_SENDER = process.env.MISSION_SENDER ?? 'admin';
+
 agent.socket.onMsg(async (senderId, name, msg, ack) => {
+    if (name !== MISSION_SENDER) {
+        console.log(`[MISSION] Ignored message from ${name} (not ${MISSION_SENDER})`);
+        if (ack) try { ack('ignored'); } catch {}
+        return;
+    }
     console.log(`\n[MISSION] Message from ${name}: ${msg}`);
     // Works for both emitAsk (ack replies to caller) and emitSay (emitSay sends a new message)
     const replyFn = (message) => {
