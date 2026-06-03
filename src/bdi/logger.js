@@ -2,8 +2,9 @@ import fs from 'fs';
 import path from 'path';
 
 const LOG_DIR = './logs';
-const LOG_FILE = path.join(LOG_DIR, 'agent.log');
-const LLM_LOG_FILE = path.join(LOG_DIR, 'llm.log');
+
+let agentId = 'agent';
+let initialized = false;
 
 function ensureLogDir() {
     if (!fs.existsSync(LOG_DIR)) {
@@ -11,23 +12,36 @@ function ensureLogDir() {
     }
 }
 
+function logFile()    { return path.join(LOG_DIR, `agent-${agentId}.log`); }
+function llmLogFile() { return path.join(LOG_DIR, `llm-${agentId}.log`); }
+
+/**
+ * Call once when the agent name becomes known (onYou callback).
+ * Truncates the log files for this session.
+ */
+function setLoggerName(name) {
+    if (initialized) return;
+    agentId = name;
+    initialized = true;
+    ensureLogDir();
+    fs.writeFileSync(logFile(),    '', 'utf8');
+    fs.writeFileSync(llmLogFile(), '', 'utf8');
+}
+
 ensureLogDir();
-fs.writeFileSync(LLM_LOG_FILE, '', 'utf8');
 
 function log(message) {
-    ensureLogDir();
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] ${message}\n`;
-    fs.appendFileSync(LOG_FILE, logEntry, 'utf8');
+    fs.appendFileSync(logFile(), logEntry, 'utf8');
     console.log(logEntry);
 }
 
 function logLLM(message) {
-    ensureLogDir();
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] ${message}\n`;
-    fs.appendFileSync(LLM_LOG_FILE, logEntry, 'utf8');
+    fs.appendFileSync(llmLogFile(), logEntry, 'utf8');
     console.log(logEntry);
 }
 
-export { log, logLLM };
+export { log, logLLM, setLoggerName };

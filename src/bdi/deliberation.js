@@ -30,7 +30,10 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
  */
 const BELIEF_THRESHOLD = 0.1;
 
-function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map(), constraints = null) {
+const UNREACHABLE_PENALTY_BASE = 100;
+const UNREACHABLE_PENALTY_TAU  = 5; // seconds — penalty halves every ~3.5s, ~0 after ~20s
+
+function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map(), constraints = null, unreachableParcels = null) {
     // parcel with low belief score is probably gone — skip immediately
     if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
     // skip parcels exceeding reward cap
@@ -55,9 +58,20 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
 
     const detoursSteps = stepsToParcel + stepsToDelivery - stepsToDeliveryNow;
 
-    return effectiveReward
+    let utility = effectiveReward
         - decay * (stepsToParcel + stepsToDelivery)
         - decay * carriedCount * detoursSteps;
+
+    if (unreachableParcels) {
+        const markedAt = unreachableParcels.get(parcel.id);
+        if (markedAt !== undefined) {
+            const elapsed = (Date.now() - markedAt) / 1000;
+            const penalty = UNREACHABLE_PENALTY_BASE * Math.exp(-elapsed / UNREACHABLE_PENALTY_TAU);
+            utility -= penalty;
+        }
+    }
+
+    return utility;
 }
 
 /**
@@ -71,7 +85,7 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
  * @param {number} threshold
  * @returns {{ type: string, id: string, utility: number }[]}
  */
-function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold) {
+function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold, unreachableParcels = null) {
     const { deliveryTiles, walkable } = beliefs.map;
     const constraints = beliefs.missionConstraints ?? null;
     const effectiveDeliveryTiles = getEffectiveDeliveryTiles(deliveryTiles, constraints);
@@ -83,7 +97,7 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
     if (!atStackMax) {
         for (const parcel of beliefs.parcels.values()) {
             if (parcel.carriedBy !== null) continue;
-            const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints);
+            const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints, unreachableParcels);
             if (utility > threshold) {
                 desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility });
             }
@@ -312,7 +326,7 @@ async function stepToward(target, agent) {
 
     if (path === null) {
         console.warn(`[PATHFIND] ✗ No path from (${Math.round(agent.x)},${Math.round(agent.y)}) to (${target.x},${target.y})`);
-        return 'stuck';
+        return 'unreachable';
     }
     if (path.length === 0) {
         console.log(`[PATHFIND] ✓ Already at target (${target.x},${target.y})`);

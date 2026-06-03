@@ -4,7 +4,7 @@ import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } 
 import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
-import { log } from './logger.js';
+import { log, setLoggerName } from './logger.js';
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
@@ -82,6 +82,7 @@ agent.socket.onConfig((config) => {
     }
 })
 agent.socket.onYou(({id, name, x, y, score, penalty}) => {
+    setLoggerName(name);
     const delta = score - agent.gameStats.lastScore;
     if (delta > 0) {
         agent.gameStats.deliveries.push({ reward: delta, timestamp: Date.now() });
@@ -101,6 +102,7 @@ agent.socket.onSensing(({ agents, parcels }) => {
 
 const visitedSpawns = new Map(); // key → timestamp of last visit
 const unreachableDeliveryTiles = new Map(); // key of delivery tiles found to be unreachable
+const unreachableParcels = new Map(); // parcelId → timestamp when marked unreachable (penalty decays over time)
 
 let llmBusy = false;
 const pendingMissions = [];
@@ -162,7 +164,7 @@ async function agentLoop() {
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
         // Always compute desires so shouldDeliver has accurate parcel count
-        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD);
+        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD, unreachableParcels);
 
         // --- deliberation (periodic, on belief change, or when intention just cleared) ---
         if (agent.shouldDeliberate() || agent.intention == null) {
@@ -261,11 +263,19 @@ async function agentLoop() {
                 console.log(`[EXECUTE] Moving to parcel ${p.id} at (${p.x},${p.y}) (${Math.round(Math.sqrt((p.x - agent.x) ** 2 + (p.y - agent.y) ** 2))} steps away)`);
                 const status = await stepToward(p, agent);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                if (status === 'stuck') {
+                if (status === 'unreachable') {
+                    // No path exists right now — mark immediately, penalty will decay over time
+                    unreachableParcels.set(p.id, Date.now());
+                    console.warn(`[STUCK] Parcel ${p.id} unreachable — penalizing, will retry as penalty decays`);
+                    agent.intention = null;
+                    agent.stuckCount = 0;
+                } else if (status === 'stuck') {
                     agent.stuckCount++;
                     console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach parcel ${p.id} at (${p.x},${p.y})`);
                     if (agent.stuckCount > 5) {
-                        console.warn(`[STUCK] Clearing intention after ${agent.stuckCount} failed moves`);
+                        // Repeated move failures — also penalize
+                        unreachableParcels.set(p.id, Date.now());
+                        console.warn(`[STUCK] Parcel ${p.id} blocked after ${agent.stuckCount} failed moves — penalizing`);
                         agent.intention = null;
                         agent.stuckCount = 0;
                     }
