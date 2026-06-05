@@ -51,13 +51,14 @@ export class BlacklistConstraint extends Constraint {
     }
 
     /**
-     * EV is always -Infinity: delivering at a blacklisted tile gives 0 points.
+     * EV is always positive: blacklisting avoids delivering at zero/penalty tiles.
      * @param {{ type:string }} params
      * @param {{ avgReward:number }} stats
      * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'blacklist') return null;
-        return { ev: -Infinity, guadagnoMissione: 0, guadagnoStandard: stats.avgReward };
+        const ev = stats.avgReward ?? 10;
+        return { ev, guadagnoMissione: ev, guadagnoStandard: 0 };
     }
 }

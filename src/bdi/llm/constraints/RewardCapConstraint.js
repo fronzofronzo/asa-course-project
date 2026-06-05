@@ -54,18 +54,18 @@ export class RewardCapConstraint extends Constraint {
     }
 
     /**
-     * EV = expected reward after filtering high-value parcels − standard expected reward.
-     * Always negative or zero since the cap can only reduce earnings.
-     * @param {{ type:string, cap?:number }} params
+     * EV = (expected reward after cap + bonus per qualifying delivery) − standard expected reward.
+     * @param {{ type:string, cap?:number, bonus?:number }} params
      * @param {{ avgReward:number }} stats
      * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'reward_cap') return null;
         const cap = params.cap ?? 10;
+        const bonus = params.bonus ?? 0;
         const { avgReward } = stats;
         const fracAboveCap = Math.max(0, 1 - cap / (avgReward * 2));
-        const guadagnoMissione = avgReward * (1 - fracAboveCap);
+        const guadagnoMissione = avgReward * (1 - fracAboveCap) + bonus;
         const guadagnoStandard = avgReward;
         return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
     }

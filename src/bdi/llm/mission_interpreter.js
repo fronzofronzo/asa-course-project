@@ -204,8 +204,8 @@ function evaluateMission(input, beliefs, getGameStats) {
         const noteMap = {
             stack:          `Stack ${n} parcels (multiplier ${params.multiplier ?? 1}x). Estimated collection time: ${(n * normalizedStats.avgCollectTime).toFixed(1)}s`,
             preferred_tile: `Deliver at preferred tile (${params.multiplier ?? 1}x reward, ~${params.extra_steps ?? 3} extra steps vs nearest tile)`,
-            blacklist:      'Blacklisted tile yields 0 pts — always reject',
-            reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap will be skipped`,
+            blacklist:      'Blacklisting avoids delivering at penalty/zero-reward tiles — always accept. Call blacklist_delivery_tile once per tile.',
+            reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap skipped. Bonus per qualifying delivery: ${params.bonus ?? 0}pts`,
             forbidden_tile: `Avoid tile: saves ~${((params.penalty ?? 50) * (params.prob_enter ?? 0.3)).toFixed(1)} penalty pts, costs ~${(DECAY * normalizedStats.avgReward * (params.extra_steps ?? 2)).toFixed(1)} pts in detours`,
             red_light:      `Stop all movement. Bonus on compliance: ${params.bonus ?? 10000} pts. EV = full bonus (zero opportunity cost assumed).`,
         }
@@ -249,8 +249,8 @@ INTERMEDIATE MISSION EVALUATION:
    Types and params:
    - {"type":"stack", "n":3, "multiplier":2.0}           — deliver N parcels at once for multiplier reward
    - {"type":"preferred_tile", "multiplier":5, "extra_steps":3}  — deliver at specific tiles for bonus
-   - {"type":"blacklist"}                                  — EV always -Infinity (always reject)
-   - {"type":"reward_cap", "cap":10}                       — skip high-reward parcels
+   - {"type":"blacklist"}                                  — EV always positive (always accept — avoids penalty tiles)
+   - {"type":"reward_cap", "cap":10, "bonus":1000}          — skip high-reward parcels; include bonus if mission states one
    - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
    - {"type":"red_light", "bonus":10000}
 
@@ -280,6 +280,7 @@ RULE 4 — INTERMEDIATE mission (stack / preferred tile / blacklist / reward cap
   Step 1: call evaluate_mission with the appropriate type and params.
   Step 2a: if EV > 0 → call the relevant L2 setter tool(s), then call get_mission_state to confirm, then Final Answer "accepted".
   Step 2b: if EV ≤ 0 → Final Answer "rejected: {reason from EV analysis}".
+  NOTE — blacklist missions always have EV > 0. If mission lists multiple tiles, call blacklist_delivery_tile once per tile.
 
 RULE 5 — Stack missions:
   "exactly N" → set_stack_requirement({"min":N,"max":N})
