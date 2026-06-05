@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import { BeliefSet } from './belief.js';
-import { generateOptions, filterIntentions, stepToward, distToNearestDelivery } from './deliberation.js';
-import { nearestDeliveryTile, nearestSpawnTile, hottestSpawnTile, computeBestSpawnTile } from './planner.js';
+import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
+import { nearestDeliveryTile, computeBestSpawnTile } from './planner.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
 import { log, setLoggerName } from './logger.js';
@@ -11,6 +11,10 @@ const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
 const UTILITY_THRESHOLD = parseFloat(process.env.UTILITY_THRESHOLD) || 0;
 const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
 const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; // ms between re-deliberation
+
+const PEER_AGENT_NAME = process.env.PEER_AGENT_NAME ?? null;
+const AGENT_ROLE     = process.env.AGENT_ROLE ?? 'master'; // 'master' | 'slave'
+let peerAgentId = process.env.PEER_AGENT_ID ?? null; // updated live when peer messages arrive
 
 class Agent {
     constructor() {
@@ -81,7 +85,7 @@ agent.socket.onConfig((config) => {
         console.log(`[CONFIG] avgReward from server: ${agent.gameStats.avgReward}`);
     }
 })
-agent.socket.onYou(({id, name, x, y, score, penalty}) => {
+agent.socket.onYou(({id, name, x, y, score}) => {
     setLoggerName(name);
     const delta = score - agent.gameStats.lastScore;
     if (delta > 0) {
@@ -100,9 +104,17 @@ agent.socket.onSensing(({ agents, parcels }) => {
     agent._notifyBeliefChanged();
 });
 
+async function safeEmit(fn, label) {
+    try { return await fn(); } catch (e) {
+        console.warn(`[${label}] socket timeout/error: ${e.message}`);
+        return null;
+    }
+}
+
 const visitedSpawns = new Map(); // key → timestamp of last visit
 const unreachableDeliveryTiles = new Map(); // key of delivery tiles found to be unreachable
 const unreachableParcels = new Map(); // parcelId → timestamp when marked unreachable (penalty decays over time)
+const handoffDropped = new Set(); // hard blacklist: parcels dropped by passer, not to be re-picked up until receiver gets them
 
 let llmBusy = false;
 const pendingMissions = [];
@@ -129,6 +141,12 @@ async function drainMissions() {
                         movementDuration: agent.gameConfig?.player?.movement_duration ?? 500,
                         pointsPerSecond: agent.score / Math.max(1, elapsed),
                     };
+                },
+                {
+                    sendToPeer: (msg) => sendToPeer(msg),
+                    getPeerAgentId: () => peerAgentId,
+                    findNearestOddRowTile: () => findNearestOddRowTile(),
+                    notifyBeliefChanged: () => agent._notifyBeliefChanged(),
                 }
             );
         } finally {
@@ -139,7 +157,120 @@ async function drainMissions() {
 
 const MISSION_SENDER = process.env.MISSION_SENDER ?? 'admin';
 
+// ─── Coordination helpers ─────────────────────────────────────────────────────
+
+function findNearestOddRowTile() {
+    const walkable = agent.beliefs.map.walkable;
+    if (!walkable) return null;
+    let best = null, bestDist = Infinity;
+    for (const key of walkable) {
+        const [tx, ty] = key.split(',').map(Number);
+        if (ty % 2 !== 0) {
+            const dist = Math.abs(agent.x - tx) + Math.abs(agent.y - ty);
+            if (dist < bestDist) { bestDist = dist; best = { x: tx, y: ty }; }
+        }
+    }
+    return best;
+}
+
+function sendToPeer(msg) {
+    if (!peerAgentId) {
+        console.warn('[COORD] Cannot send to peer: peerAgentId not known yet');
+        return;
+    }
+    agent.socket.emitSay(peerAgentId, typeof msg === 'string' ? msg : JSON.stringify(msg));
+}
+
+function handleCoordinationMessage(senderId, msg) {
+    peerAgentId = senderId; // track peer ID
+
+    let parsed;
+    try { parsed = JSON.parse(msg); } catch {
+        console.log(`[COORD] Non-JSON peer message (ignoring): ${msg}`);
+        return;
+    }
+
+    const coord = agent.beliefs.missionConstraints.coordination;
+
+    if (parsed.type === 'coord_cmd') {
+        const { mission, params = {} } = parsed;
+        console.log(`\n[COORD] Command from peer: mission=${mission}`);
+
+        if (mission === 'meet_and_wait') {
+            const { x, y, maxDist = 3 } = params;
+            coord.setRendezvous(x, y, maxDist);
+            agent.beliefs.tileUtilities.set(`${x},${y}`, 1000);
+            agent.needsDeliberation = true;
+            console.log(`[COORD] meet_and_wait: navigating to (${x},${y}) within dist ${maxDist}`);
+            sendToPeer({ type: 'coord_ack', mission, status: 'accepted' });
+
+        } else if (mission === 'parcel_handoff') {
+            const { role } = params;
+            coord.setHandoff(role);
+            // Receiver waits for 'ready' signal from passer before navigating
+            console.log(`[COORD] parcel_handoff: role=${role} — waiting for passer position`);
+            sendToPeer({ type: 'coord_ack', mission, status: 'accepted' });
+
+        } else if (mission === 'odd_row_wait') {
+            coord.setOddRowWait();
+            const target = findNearestOddRowTile();
+            if (target) {
+                agent.beliefs.tileUtilities.set(`${target.x},${target.y}`, 1000);
+                agent.needsDeliberation = true;
+                console.log(`[COORD] odd_row_wait: navigating to odd row tile (${target.x},${target.y})`);
+            } else {
+                console.warn('[COORD] odd_row_wait: no odd-row tile found on map');
+            }
+            sendToPeer({ type: 'coord_ack', mission, status: 'accepted' });
+
+        } else if (mission === 'release_coordination') {
+            agent.beliefs.missionConstraints.redLight.set(false);
+            agent.beliefs.missionConstraints.coordination.reset();
+            console.log('[COORD] Coordination released by master — resuming normal play');
+
+        } else {
+            console.warn(`[COORD] Unknown coord_cmd mission: ${mission}`);
+        }
+
+    } else if (parsed.type === 'coord_status') {
+        const { event } = parsed;
+        if (event === 'ready' && coord.handoff?.role === 'receiver' && parsed.pos) {
+            // Passer frozen in place with parcels — navigate to their position
+            agent.beliefs.tileUtilities.set(`${Math.round(parsed.pos.x)},${Math.round(parsed.pos.y)}`, 1000);
+            agent.needsDeliberation = true;
+            console.log(`[COORD] Passer waiting at (${parsed.pos.x},${parsed.pos.y}) — navigating there`);
+        } else if (event === 'dropped' && coord.handoff?.role === 'receiver') {
+            coord.clearHandoff();
+            if (parsed.tile) {
+                agent.beliefs.tileUtilities.set(`${Math.round(parsed.tile.x)},${Math.round(parsed.tile.y)}`, 1000);
+                agent.needsDeliberation = true;
+            }
+            console.log('[COORD] Peer dropped parcel — going to pick up');
+        } else if (event === 'arrived' && coord.rendezvous) {
+            coord.rendezvous.peerArrived = true;
+            console.log('[COORD] Peer arrived at rendezvous');
+        } else if (event === 'arrived' && coord.oddRowWait) {
+            console.log('[COORD] Peer arrived at odd row');
+        }
+
+    } else if (parsed.type === 'coord_ack') {
+        console.log(`[COORD] Peer ack: mission=${parsed.mission} status=${parsed.status}`);
+    }
+}
+
 agent.socket.onMsg(async (senderId, name, msg, ack) => {
+    // Peer agent message → coordination handler (no LLM)
+    if (PEER_AGENT_NAME && name === PEER_AGENT_NAME) {
+        handleCoordinationMessage(senderId, msg);
+        if (ack) try { ack('ok'); } catch {}
+        return;
+    }
+    // Slave ignores all non-peer messages — only master interprets admin missions
+    if (AGENT_ROLE === 'slave') {
+        console.log(`[SLAVE] Ignoring message from ${name} (slave role — contact master)`);
+        if (ack) try { ack(`slave: send missions to master agent`); } catch {}
+        return;
+    }
     if (name !== MISSION_SENDER) {
         console.log(`[MISSION] Ignored message from ${name} (not ${MISSION_SENDER})`);
         if (ack) try { ack('ignored'); } catch {}
@@ -171,7 +302,7 @@ async function agentLoop() {
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
         // Always compute desires so shouldDeliver has accurate parcel count
-        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD, unreachableParcels);
+        const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD, unreachableParcels, handoffDropped);
 
         // --- deliberation (periodic, on belief change, or when intention just cleared) ---
         if (agent.shouldDeliberate() || agent.intention == null) {
@@ -197,6 +328,63 @@ async function agentLoop() {
             agent.recordDeliberation();
         }
 
+        // --- coordination state checks (before execution) ---
+        {
+            const coord = agent.beliefs.missionConstraints.coordination;
+            const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
+
+            // Rendezvous: freeze when within maxDist of target
+            if (coord.rendezvous && !coord.rendezvous.selfArrived && isStable) {
+                const r = coord.rendezvous;
+                const dist = Math.abs(agent.x - r.x) + Math.abs(agent.y - r.y);
+                if (dist <= r.maxDist) {
+                    r.selfArrived = true;
+                    agent.beliefs.missionConstraints.redLight.set(true);
+                    sendToPeer({ type: 'coord_status', mission: 'meet_and_wait', event: 'arrived' });
+                    console.log(`[COORD] Arrived at rendezvous (${agent.x},${agent.y}) dist=${dist} — freezing`);
+                }
+            }
+
+            // Odd row: freeze when on any odd-y tile
+            if (coord.oddRowWait && !coord.oddRowArrived && isStable && agent.y % 2 !== 0) {
+                coord.oddRowArrived = true;
+                agent.beliefs.missionConstraints.redLight.set(true);
+                sendToPeer({ type: 'coord_status', mission: 'odd_row_wait', event: 'arrived' });
+                console.log(`[COORD] Arrived at odd row y=${agent.y} — freezing`);
+            }
+
+            // Passer: once carrying a parcel, freeze in place and wait for receiver
+            if (coord.handoff?.role === 'passer' && coord.handoff.state === 'pending' && carriedCount > 0 && isStable) {
+                if (!coord.handoff.positionSent) {
+                    coord.handoff.positionSent = true;
+                    sendToPeer({ type: 'coord_status', mission: 'parcel_handoff', event: 'ready', pos: { x: agent.x, y: agent.y } });
+                    console.log(`[COORD] Passer frozen at (${agent.x},${agent.y}) with ${carriedCount} parcel(s) — waiting for receiver`);
+                }
+                const receiverVisible = [...agent.beliefs.agents.values()].some(a => a.id === peerAgentId || a.name === PEER_AGENT_NAME);
+                if (receiverVisible) {
+                    // Record IDs BEFORE drop — emitPutdown on non-delivery tile returns [] (not the parcels)
+                    const toDrop = [...agent.carriedParcels];
+                    await safeEmit(() => agent.socket.emitPutdown(), 'PUTDOWN');
+                    // Hard-blacklist so passer never re-picks them up until receiver collects
+                    for (const p of toDrop) handoffDropped.add(p.id);
+                    setTimeout(() => { for (const p of toDrop) handoffDropped.delete(p.id); }, 60_000);
+                    sendToPeer({ type: 'coord_status', mission: 'parcel_handoff', event: 'dropped', tile: { x: agent.x, y: agent.y } });
+                    coord.clearHandoff();
+                    agent._notifyBeliefChanged();
+                    console.log(`[COORD] Receiver in range — dropped ${toDrop.length} parcel(s) at (${agent.x},${agent.y})`);
+                } else {
+                    await new Promise(r => setTimeout(r, 50));
+                    continue; // freeze: skip execution branches this iteration
+                }
+            }
+        }
+
+        // Respect movement freeze (red light, coordination wait states)
+        if (agent.beliefs.missionConstraints.isMovementFrozen()) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+        }
+
         // --- execution (continuous, one step per iteration) ---
         if (agent.intention?.type === 'DELIVER') {
             console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
@@ -212,14 +400,14 @@ async function agentLoop() {
                         console.log(`[STACK] Carrying ${carriedCount}/${stackMin} min — aborting delivery, parcels still exist`);
                         agent.intention = null; // re-deliberate: find more parcels
                     } else {
-                        const dropped = await agent.socket.emitPutdown();
+                        await safeEmit(() => agent.socket.emitPutdown(), 'PUTDOWN');
                         console.log(`[STACK] Carrying ${carriedCount}/${stackMin} min — delivering anyway (no more parcels to collect)`);
                         agent.stuckCount = 0;
                         agent.intention = null;
                     }
                 } else {
-                    const dropped = await agent.socket.emitPutdown();
-                    console.log(`[EXECUTE] ✓ Delivered ${dropped.length} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                    const dropped = await safeEmit(() => agent.socket.emitPutdown(), 'PUTDOWN');
+                    console.log(`[EXECUTE] ✓ Delivered ${dropped?.length ?? 0} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     agent.stuckCount = 0;
                     agent.intention = null;
                 }
@@ -247,7 +435,7 @@ async function agentLoop() {
 
             if (onParcel) {
                 console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
-                const pickedUp = await agent.socket.emitPickup();
+                const pickedUp = await safeEmit(() => agent.socket.emitPickup(), 'PICKUP');
                 if (pickedUp?.length > 0) {
                     const stackMax = agent.beliefs.missionConstraints?.stack?.max ?? null;
                     const newTotal = carriedCount + pickedUp.length;
@@ -255,7 +443,7 @@ async function agentLoop() {
                         // emitPickup grabbed more than stack.max allows — drop excess immediately
                         const excess = newTotal - stackMax;
                         const toDrop = pickedUp.slice(pickedUp.length - excess).map(q => q.id);
-                        await agent.socket.emitPutdown(toDrop);
+                        await safeEmit(() => agent.socket.emitPutdown(toDrop), 'PUTDOWN');
                         console.log(`[STACK] Picked up ${pickedUp.length}, dropped ${toDrop.length} excess to stay at max=${stackMax}`);
                     } else {
                         console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);

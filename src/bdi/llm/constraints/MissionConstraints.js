@@ -4,6 +4,7 @@ import { BlacklistConstraint }          from './BlacklistConstraint.js';
 import { RewardCapConstraint }          from './RewardCapConstraint.js';
 import { ForbiddenTileConstraint }      from './ForbiddenTileConstraint.js';
 import { RedLightConstraint }           from './RedLightConstraint.js';
+import { CoordinationConstraint }       from './CoordinationConstraint.js';
 
 /**
  * Registry and orchestrator for all active mission constraints.
@@ -13,14 +14,15 @@ import { RedLightConstraint }           from './RedLightConstraint.js';
  */
 export class MissionConstraints {
     constructor() {
-        this.stack     = new StackConstraint();
-        this.preferred = new PreferredDeliveryConstraint();
-        this.blacklist = new BlacklistConstraint();
-        this.rewardCap = new RewardCapConstraint();
-        this.forbidden = new ForbiddenTileConstraint();
-        this.redLight  = new RedLightConstraint();
+        this.stack        = new StackConstraint();
+        this.preferred    = new PreferredDeliveryConstraint();
+        this.blacklist    = new BlacklistConstraint();
+        this.rewardCap    = new RewardCapConstraint();
+        this.forbidden    = new ForbiddenTileConstraint();
+        this.redLight     = new RedLightConstraint();
+        this.coordination = new CoordinationConstraint();
         /** @type {import('./Constraint.js').Constraint[]} */
-        this._all = [this.stack, this.preferred, this.blacklist, this.rewardCap, this.forbidden, this.redLight];
+        this._all = [this.stack, this.preferred, this.blacklist, this.rewardCap, this.forbidden, this.redLight, this.coordination];
     }
 
     /**

@@ -165,7 +165,6 @@ function computeBestSpawnTile(agent, visitedSpawns) {
         const agentFactor = Math.max(0, 1 - nearbyAgents * 0.4); // 0 at 3+ agents
 
         const score = (distScore + heatScore) * recencyFactor * agentFactor;
-        log(`Spawn tile (${tile.x},${tile.y}): dist=${d} score=${score.toFixed(3)} (distScore=${distScore.toFixed(3)}, heat=${heatScore.toFixed(3)}, recencyFactor=${recencyFactor.toFixed(3)}, agentFactor=${agentFactor.toFixed(3)}, nearbyAgents=${nearbyAgents})`);
         if (score > bestScore) { bestScore = score; best = tile; }
     }
     return best;

@@ -163,13 +163,20 @@ function addForbiddenTile(input, beliefs) {
     }
 }
 
-function setMovementFreeze(input, beliefs) {
+function setMovementFreeze(input, beliefs, coordinationCtx) {
     const val = input.trim().toLowerCase().replace(/^["']+|["']+$/g, '')
     if (!['true', 'false'].includes(val)) return 'Error: input must be "true" (red light / stop) or "false" (green light / go)'
     beliefs.missionConstraints.redLight.set(val === 'true')
+    // On green light: relay to slave and clear coordination state
+    if (val === 'false' && coordinationCtx?.sendToPeer) {
+        if (beliefs.missionConstraints.coordination.isActive()) {
+            coordinationCtx.sendToPeer({ type: 'coord_cmd', mission: 'release_coordination' })
+        }
+        beliefs.missionConstraints.coordination.reset()
+    }
     return val === 'true'
         ? 'Red light active: movement frozen. Agent will not move until green light.'
-        : 'Green light: movement resumed. Agent is free to act.'
+        : 'Green light: movement resumed. Coordination released. Relayed to peer if applicable.'
 }
 
 function getMissionState(beliefs) {
@@ -182,7 +189,73 @@ function resetMission(beliefs) {
     return 'Mission reset — all constraints cleared, returning to standard play'
 }
 
-function evaluateMission(input, beliefs, getGameStats) {
+// ─── L3 Coordination tools (master only) ─────────────────────────────────────
+
+function getPeerInfo(beliefs, getState, coordinationCtx) {
+    try {
+        const { x, y } = getState()
+        const peerId = coordinationCtx?.getPeerAgentId?.() ?? null
+        const peerName = process.env.PEER_AGENT_NAME ?? null
+        let peer = null
+        // Prefer the agent matching PEER_AGENT_NAME or PEER_AGENT_ID over any random NPC
+        for (const [, a] of beliefs.agents) {
+            if ((peerName && a.name === peerName) || (peerId && a.id === peerId)) {
+                peer = a; break
+            }
+        }
+        // Fallback: first sensed agent
+        if (!peer) for (const [, a] of beliefs.agents) { peer = a; break }
+        return JSON.stringify({
+            peerId: peer?.id ?? peerId ?? 'unknown (not in sensing range)',
+            peerName: peer?.name ?? 'unknown',
+            peerPosition: peer ? { x: peer.x, y: peer.y } : null,
+            myPosition: { x, y },
+            hint: 'If peerId is unknown, set PEER_AGENT_ID in .env or wait for peer to come into sensing range',
+        })
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
+function setRendezvous(input, beliefs, coordinationCtx) {
+    try {
+        const { x, y, maxDist = 3 } = JSON.parse(input)
+        if (typeof x !== 'number' || typeof y !== 'number') return 'Error: x and y must be numbers'
+        if (!coordinationCtx?.sendToPeer) return 'Error: not configured as master (sendToPeer unavailable)'
+        beliefs.missionConstraints.coordination.setRendezvous(x, y, maxDist)
+        beliefs.tileUtilities.set(`${Math.round(x)},${Math.round(y)}`, 1000)
+        coordinationCtx.notifyBeliefChanged?.()
+        coordinationCtx.sendToPeer({ type: 'coord_cmd', mission: 'meet_and_wait', params: { x, y, maxDist } })
+        return `Rendezvous set at (${x},${y}) maxDist=${maxDist}. Command sent to peer. Navigating there now.`
+    } catch (e) {
+        return `Error: invalid JSON. Expected: {"x":N,"y":N,"maxDist":3}. Got: ${input}`
+    }
+}
+
+function initiateHandoff(_input, beliefs, coordinationCtx) {
+    if (!coordinationCtx?.sendToPeer) return 'Error: not configured as master (sendToPeer unavailable)'
+    beliefs.missionConstraints.coordination.setHandoff('passer')
+    coordinationCtx.sendToPeer({ type: 'coord_cmd', mission: 'parcel_handoff', params: { role: 'receiver' } })
+    return 'Handoff initiated. I am passer, peer is receiver. I will pick up a parcel, then freeze in place until peer arrives in sensing range, then drop for peer to deliver.'
+}
+
+function setOddRowFreeze(beliefs, _getState, coordinationCtx) {
+    try {
+        if (!coordinationCtx?.sendToPeer) return 'Error: not configured as master (sendToPeer unavailable)'
+        beliefs.missionConstraints.coordination.setOddRowWait()
+        const target = coordinationCtx?.findNearestOddRowTile?.()
+        if (target) {
+            beliefs.tileUtilities.set(`${target.x},${target.y}`, 1000)
+            coordinationCtx.notifyBeliefChanged?.()
+        }
+        coordinationCtx.sendToPeer({ type: 'coord_cmd', mission: 'odd_row_wait' })
+        return `Odd row freeze set. My target: (${target?.x ?? '?'},${target?.y ?? '?'}). Command sent to peer. Both agents will navigate to odd-y tile then freeze.`
+    } catch (e) {
+        return `Error: ${e.message}`
+    }
+}
+
+function evaluateMission(input, beliefs, getGameStats, getState) {
     try {
         const params = JSON.parse(input)
         const stats = getGameStats()
@@ -190,12 +263,19 @@ function evaluateMission(input, beliefs, getGameStats) {
             avgReward:       stats.avgReward ?? 10,
             avgCollectTime:  (stats.movementDuration ?? 500) / 1000 * 5,
             decay:           DECAY,
-            pps:             stats.pointsPerSecond ?? 1,
+            // Cap pps using game-config avgReward (constant, unaffected by mission bonuses)
+            // avgDeliveryReward inflates when coordination bonuses (500/700pts) hit the rolling window
+            pps: Math.min(
+                stats.pointsPerSecond ?? 1,
+                (stats.avgReward ?? 10) / ((stats.movementDuration ?? 500) / 1000 * 15)
+            ),
+            movDurationSec:  (stats.movementDuration ?? 500) / 1000,
+            position:        getState ? getState() : { x: 0, y: 0 },
         }
 
         const result = beliefs.missionConstraints.computeEV(params, normalizedStats)
         if (!result) {
-            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile | red_light`
+            return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile | red_light | meet_and_wait | parcel_handoff | odd_row_wait`
         }
 
         const { ev, guadagnoMissione: missionGain, guadagnoStandard: standardGain } = result
@@ -208,6 +288,9 @@ function evaluateMission(input, beliefs, getGameStats) {
             reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap will be skipped`,
             forbidden_tile: `Avoid tile: saves ~${((params.penalty ?? 50) * (params.prob_enter ?? 0.3)).toFixed(1)} penalty pts, costs ~${(DECAY * normalizedStats.avgReward * (params.extra_steps ?? 2)).toFixed(1)} pts in detours`,
             red_light:      `Stop all movement. Bonus on compliance: ${params.bonus ?? 10000} pts. EV = full bonus (zero opportunity cost assumed).`,
+            meet_and_wait:  `Both agents converge on (${params.x ?? '?'},${params.y ?? '?'}) within dist ${params.maxDist ?? 3}. Bonus ${params.bonus ?? 500} pts vs opp cost ${missionGain > 0 ? (missionGain - ev).toFixed(1) : '?'} pts.`,
+            parcel_handoff: `Passer drops parcel at handoff tile; receiver delivers. Bonus ${params.bonus ?? 200} pts vs ~${standardGain.toFixed(1)} pts opp cost (${params.extra_steps ?? 8} extra steps).`,
+            odd_row_wait:   `All agents freeze on odd row. Bonus ${params.bonus ?? 700} pts vs ~${standardGain.toFixed(1)} pts lost (${params.wait_seconds ?? 30}s freeze).`,
         }
 
         const rec = ev > 0
@@ -229,12 +312,15 @@ Your ONLY job is to interpret special mission messages, evaluate them, and confi
 == GAME CONTEXT ==
 Grid-based game. Coordinates: right=x+1, up=y+1. Agent collects parcels from spawn tiles, delivers to delivery tiles.
 Parcel rewards decay over time — act fast. Standard play: pick nearest parcel, deliver to nearest tile.
+This agent may operate in a MASTER role coordinating a partner slave agent.
 
 == MISSION TYPES ==
 
 TYPE 1 — ATOMIC: One-shot action (GOTO or answer a question).
 TYPE 2 — INTERMEDIATE: Persistent strategy change. Requires evaluate_mission then L2 setter tools.
   Examples: stack N parcels, deliver only at tile (x,y), avoid tile (x,y), skip high-reward parcels.
+TYPE 3 — COORDINATION: Requires both agents to act together. Always accept — bonuses are large fixed values.
+  Examples: meet at (x,y), parcel handoff between agents, all agents freeze on odd row.
 
 == TOOLS ==
 
@@ -247,23 +333,31 @@ STANDARD:
 INTERMEDIATE MISSION EVALUATION:
 5. evaluate_mission — Input: JSON with "type" field — Returns EV analysis and recommendation
    Types and params:
-   - {"type":"stack", "n":3, "multiplier":2.0}           — deliver N parcels at once for multiplier reward
-   - {"type":"preferred_tile", "multiplier":5, "extra_steps":3}  — deliver at specific tiles for bonus
-   - {"type":"blacklist"}                                  — EV always -Infinity (always reject)
-   - {"type":"reward_cap", "cap":10}                       — skip high-reward parcels
+   - {"type":"stack", "n":3, "multiplier":2.0}
+   - {"type":"preferred_tile", "multiplier":5, "extra_steps":3}
+   - {"type":"blacklist"}
+   - {"type":"reward_cap", "cap":10}
    - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
    - {"type":"red_light", "bonus":10000}
+   - {"type":"meet_and_wait", "bonus":500, "x":N, "y":N, "wait_seconds":10}   — include target coords so EV accounts for travel time
+   - {"type":"parcel_handoff", "bonus":200, "extra_steps":8}                  — estimate of extra steps vs direct delivery
+   - {"type":"odd_row_wait", "bonus":700, "steps_to_odd_row":3, "wait_seconds":30} — estimate wait duration
 
 INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
 6. set_stack_requirement — Input: {"min":N or null, "max":N or null}
-   - "exactly N": {"min":N,"max":N}   — "at least N": {"min":N,"max":null}   — "at most N": {"min":null,"max":N}
 7. set_preferred_delivery_tiles — Input: {"tiles":[{"x":N,"y":N},...], "multiplier":M}
-8. blacklist_delivery_tile — Input: {"x":N,"y":N} — Never deliver here
-9. set_reward_cap — Input: number string, e.g. "10.5" — Skip parcels above this reward
-10. add_forbidden_tile — Input: {"x":N,"y":N} — Pathfinding avoids this tile
-11. set_movement_freeze — Input: "true" or "false" — "true" = red light (freeze all movement), "false" = green light (resume movement)
+8. blacklist_delivery_tile — Input: {"x":N,"y":N}
+9. set_reward_cap — Input: number string, e.g. "10.5"
+10. add_forbidden_tile — Input: {"x":N,"y":N}
+11. set_movement_freeze — Input: "true" or "false" — freeze/unfreeze movement; also relays to peer if coordination active
 12. get_mission_state — Input: "" — Returns current constraints snapshot
 13. reset_mission — Input: "" — Clears all constraints
+
+COORDINATION MISSION SETUP (TYPE 3 — master role only):
+14. get_peer_info — Input: "" — Returns peer agent id, name, position
+15. set_rendezvous — Input: {"x":N,"y":N,"maxDist":3} — Both agents navigate to (x,y) within maxDist, then freeze
+16. initiate_handoff — Input: "" (no params needed) — I become passer (pick up parcel, freeze in place, drop when peer arrives); peer becomes receiver (navigate to me, pick up, deliver)
+17. set_odd_row_freeze — Input: "" — Both agents navigate to nearest odd-y tile, then freeze until "green light"
 
 == MISSION HANDLING RULES ==
 
@@ -293,6 +387,24 @@ RULE 7 — RED LIGHT / STOP missions ("stop", "freeze", "don't move", "wait unti
   Step 2: EV is always positive — call set_movement_freeze("true"), then Final Answer "accepted".
   When a follow-up "green light" / "go" / "resume" message arrives: call set_movement_freeze("false").
 
+RULE 8 — MEET AND WAIT coordination mission:
+  Step 1: evaluate_mission({"type":"meet_and_wait","bonus":500})
+  Step 2: call get_peer_info to confirm peer is known.
+  Step 3: call set_rendezvous({"x":N,"y":N,"maxDist":3}) with the stated coordinates.
+  Step 4: Final Answer "accepted — both agents converging on (x,y)".
+  When a follow-up "go" / "resume" message arrives: call set_movement_freeze("false") to release both agents.
+
+RULE 9 — PARCEL HANDOFF coordination mission:
+  Step 1: evaluate_mission({"type":"parcel_handoff","bonus":200})
+  Step 2: call initiate_handoff("") — no params needed.
+  Step 3: Final Answer "accepted — I will pick up a parcel, freeze in place, drop when peer is nearby; peer will collect and deliver".
+
+RULE 10 — ODD ROW / RED-LIGHT-GREEN-LIGHT coordination mission:
+  Step 1: evaluate_mission({"type":"odd_row_wait","bonus":700})
+  Step 2: call set_odd_row_freeze("") — this picks the nearest odd-y tile and commands peer automatically.
+  Step 3: Final Answer "accepted — both agents navigating to odd row and freezing".
+  When a follow-up "go" / "resume" / "green light" message arrives: call set_movement_freeze("false").
+
 == OUTPUT FORMAT — choose exactly one per message ==
 
 FORMAT A — use a tool:
@@ -309,7 +421,11 @@ Never output Action and Final Answer in the same message. Never write "Action: N
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 
-export async function interpretMission(senderName, msg, beliefs, getState, replyFn, getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 })) {
+export async function interpretMission(
+    senderName, msg, beliefs, getState, replyFn,
+    getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 }),
+    coordinationCtx = null
+) {
     if (!client) {
         logLLM('[MissionInterpreter] No LLM client — skipping mission interpretation')
         return
@@ -322,15 +438,20 @@ export async function interpretMission(senderName, msg, beliefs, getState, reply
         calculate:                     (input)  => calculate(input),
         set_tile_utility:              (input)  => setTileUtility(input, beliefs),
         reply_to_sender:               (input)  => replyToSender(input, replyFn),
-        evaluate_mission:              (input)  => evaluateMission(input, beliefs, getGameStats),
+        evaluate_mission:              (input)  => evaluateMission(input, beliefs, getGameStats, getState),
         set_stack_requirement:         (input)  => setStackRequirement(input, beliefs),
         set_preferred_delivery_tiles:  (input)  => setPreferredDeliveryTiles(input, beliefs),
         blacklist_delivery_tile:       (input)  => blacklistDeliveryTile(input, beliefs),
         set_reward_cap:                (input)  => setRewardCap(input, beliefs),
         add_forbidden_tile:            (input)  => addForbiddenTile(input, beliefs),
-        set_movement_freeze:           (input)  => setMovementFreeze(input, beliefs),
+        set_movement_freeze:           (input)  => setMovementFreeze(input, beliefs, coordinationCtx),
         get_mission_state:             (_input) => getMissionState(beliefs),
         reset_mission:                 (_input) => resetMission(beliefs),
+        // L3 coordination tools (master only)
+        get_peer_info:                 (_input) => getPeerInfo(beliefs, getState, coordinationCtx),
+        set_rendezvous:                (input)  => setRendezvous(input, beliefs, coordinationCtx),
+        initiate_handoff:              (input)  => initiateHandoff(input, beliefs, coordinationCtx),
+        set_odd_row_freeze:            (_input) => setOddRowFreeze(beliefs, getState, coordinationCtx),
     }
 
     const messages = [

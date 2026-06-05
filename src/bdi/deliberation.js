@@ -85,7 +85,7 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
  * @param {number} threshold
  * @returns {{ type: string, id: string, utility: number }[]}
  */
-function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold, unreachableParcels = null) {
+function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold, unreachableParcels = null, hardBlacklist = null) {
     const { deliveryTiles, walkable } = beliefs.map;
     const constraints = beliefs.missionConstraints ?? null;
     const effectiveDeliveryTiles = getEffectiveDeliveryTiles(deliveryTiles, constraints);
@@ -97,6 +97,7 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
     if (!atStackMax) {
         for (const parcel of beliefs.parcels.values()) {
             if (parcel.carriedBy !== null) continue;
+            if (hardBlacklist?.has(parcel.id)) continue; // hard skip: handoff-dropped parcels
             const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints, unreachableParcels);
             if (utility > threshold) {
                 desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility });
@@ -255,8 +256,13 @@ async function go_to(target, agent) {
         }
         if (path.length === 0) return true;
 
-        const result = await agent.socket.emitMove(path[0]);
-
+        let result;
+        try {
+            result = await agent.socket.emitMove(path[0]);
+        } catch (e) {
+            console.warn(`go_to: move ${path[0]} threw: ${e.message} — replanning`);
+            continue;
+        }
         if (result === false) {
             console.warn(`go_to: move ${path[0]} failed, replanning`);
             continue;
@@ -292,26 +298,6 @@ async function stepToward(target, agent) {
     if (!isWalkable) {
         console.warn(`[STEPTOWARD] ✗ Target (${to.x},${to.y}) is NOT walkable!`);
         return 'stuck';
-    }
-    
-    const rightTileX = Math.round(agent.x) + 1;
-    const rightTileY = Math.round(agent.y);
-    const rightKey = `${rightTileX},${rightTileY}`;
-    const rightTile = agent.beliefs.map.tiles.get(rightKey);
-    console.log(`[STEPTOWARD] Tile to the right (${rightKey}):`, rightTile ? `type=${rightTile.type}` : 'NO TILE');
-    console.log(`[STEPTOWARD] Is right tile walkable? ${agent.beliefs.map.walkable.has(rightKey)}`);
-    
-    console.log(`[STEPTOWARD] All tiles around (${Math.round(agent.x)},${Math.round(agent.y)}):`);
-    for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-            const key = `${Math.round(agent.x) + dx},${Math.round(agent.y) + dy}`;
-            const tile = agent.beliefs.map.tiles.get(key);
-            if (tile) {
-                console.log(`  (${tile.x},${tile.y}) type=${tile.type} walkable=${agent.beliefs.map.walkable.has(key)}`);
-            } else {
-                console.log(`  (${Math.round(agent.x) + dx},${Math.round(agent.y) + dy}) NO TILE DEFINED`);
-            }
-        }
     }
     
     const forbidden = agent.beliefs.missionConstraints?.forbidden.tiles ?? new Set();
@@ -353,7 +339,13 @@ async function stepToward(target, agent) {
         return 'stuck';
     }
     
-    const result = await agent.socket.emitMove(nextMove);
+    let result;
+    try {
+        result = await agent.socket.emitMove(nextMove);
+    } catch (e) {
+        console.warn(`[MOVE] ✗ ${nextMove} threw: ${e.message} — treating as stuck`);
+        return 'stuck';
+    }
     if (result === false) {
         console.warn(`[MOVE] ✗ Move ${nextMove} failed at (${Math.round(agent.x)},${Math.round(agent.y)})`);
         return 'stuck';
