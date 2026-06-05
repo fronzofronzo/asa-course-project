@@ -40,7 +40,18 @@ function extractFinalAnswer(text) {
 
 function calculate(expression) {
     try {
-        return String(eval(expression))
+        // LLM often wraps the input in quotes ("4*2") or adds spaces/unit suffixes — strip them
+        // so eval sees a bare arithmetic expression, not a string literal.
+        let expr = String(expression).trim().replace(/^["'`]+|["'`]+$/g, '').trim()
+        expr = expr.replace(/(pts?|points?)\s*$/i, '').trim() // drop trailing "pt"/"pts"/"points"
+        if (!/^[\d\s+\-*/().]+$/.test(expr)) {
+            return `Error: not a pure arithmetic expression: "${expr}". Use only numbers and + - * / ( ).`
+        }
+        const result = eval(expr)
+        if (typeof result !== 'number' || !isFinite(result)) {
+            return `Error: expression did not evaluate to a finite number: "${expr}"`
+        }
+        return String(result)
     } catch (e) {
         return `Error: ${e.message}`
     }
@@ -368,9 +379,13 @@ RULE 2 — GOTO mission ("move to (x,y) and get +N pts"):
   - A message about what happens when you DELIVER at a tile ("deliver in (x,y) and you get 0 pts",
     "no reward / penalty when delivering at (x,y)") is NOT a GOTO — it is a BLACKLIST mission → use RULE 4
     with {"type":"blacklist"}. Do NOT reject it as zero-reward.
-  - If coordinates contain math (e.g. x=4*2), call calculate first.
-  - If reward > 0: call set_tile_utility, then Final Answer.
-  - If reward ≤ 0: Final Answer "Mission rejected: negative/zero reward".
+  - ALWAYS resolve every math expression with the calculate tool BEFORE deciding — never compute in your head.
+    Step A: if the coordinates contain math (e.g. x=4*2, y=(1+3)*3), call calculate for EACH coordinate.
+    Step B: if the REWARD contains math (e.g. "-2*(-5)pts", "(3-1)*4pts"), call calculate on the reward expression too.
+            The sign is only known AFTER evaluating — e.g. -2*(-5) = +10 is POSITIVE, do NOT reject on the leading minus.
+    Step C: only once x, y and reward are all numeric, decide:
+            - reward > 0 → call set_tile_utility with the computed reward, then Final Answer.
+            - reward ≤ 0 → Final Answer "Mission rejected: negative/zero reward".
 
 RULE 3 — Knowledge/question mission: answer and call reply_to_sender, then Final Answer.
 
