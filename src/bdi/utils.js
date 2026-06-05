@@ -102,6 +102,12 @@ function getEffectiveDeliveryTiles(all, constraints) {
         const filtered = tiles.filter(t => !bl.has(`${t.x},${t.y}`));
         if (filtered.length > 0) tiles = filtered;
     }
+    // A forbidden tile can't be entered → it can't be a delivery destination either.
+    const fb = constraints.forbidden?.tiles;
+    if (fb && fb.size > 0) {
+        const filtered = tiles.filter(t => !fb.has(`${t.x},${t.y}`));
+        if (filtered.length > 0) tiles = filtered;
+    }
     return tiles;
 }
 

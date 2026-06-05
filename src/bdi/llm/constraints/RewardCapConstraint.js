@@ -54,19 +54,22 @@ export class RewardCapConstraint extends Constraint {
     }
 
     /**
-     * EV = (expected reward after cap + bonus per qualifying delivery) − standard expected reward.
-     * @param {{ type:string, cap?:number, bonus?:number }} params
+     * Imposed-penalty mission: over-cap deliveries score 0 whether or not we adapt.
+     * ACCEPT = stop collecting over-cap parcels (every trip productive).
+     * REJECT = keep collecting them, but a `fracAboveCap` share of effort yields 0 → wasted.
+     * So EV = adaptive gain − (adaptive gain discounted by that wasted fraction) ≥ 0.
+     * @param {{ type:string, cap?:number }} params
      * @param {{ avgReward:number }} stats
      * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'reward_cap') return null;
         const cap = params.cap ?? 10;
-        const bonus = params.bonus ?? 0;
         const { avgReward } = stats;
         const fracAboveCap = Math.max(0, 1 - cap / (avgReward * 2));
-        const guadagnoMissione = avgReward * (1 - fracAboveCap) + bonus;
-        const guadagnoStandard = avgReward;
+        const guadagnoMissione = avgReward * (1 - fracAboveCap);
+        // Ignoring the rule wastes the over-cap fraction of effort (those deliveries pay 0).
+        const guadagnoStandard = guadagnoMissione * (1 - fracAboveCap);
         return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
     }
 }

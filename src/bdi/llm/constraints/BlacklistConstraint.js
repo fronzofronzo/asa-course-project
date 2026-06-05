@@ -51,14 +51,20 @@ export class BlacklistConstraint extends Constraint {
     }
 
     /**
-     * EV is always positive: blacklisting avoids delivering at zero/penalty tiles.
-     * @param {{ type:string }} params
-     * @param {{ avgReward:number }} stats
+     * Imposed-penalty mission: the named tile scores 0 whether or not we adapt.
+     * ACCEPT = deliver at another delivery tile (costs only a small detour) → ≈ avgReward.
+     * REJECT = keep delivering at the dead tile → 0 (whole load lost).
+     * So EV = (avgReward − detour cost) − 0 ≈ positive: adapting almost always wins.
+     * @param {{ type:string, extra_steps?:number }} params
+     * @param {{ avgReward:number, decay:number }} stats
      * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'blacklist') return null;
-        const ev = stats.avgReward ?? 10;
-        return { ev, guadagnoMissione: ev, guadagnoStandard: 0 };
+        const { avgReward, decay } = stats;
+        const detourSteps = params.extra_steps ?? 3;
+        const guadagnoMissione = Math.max(0, avgReward - decay * avgReward * detourSteps);
+        const guadagnoStandard = 0; // ignoring the rule = delivery at the dead tile = 0 pts
+        return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
     }
 }

@@ -75,20 +75,24 @@ export class StackConstraint extends Constraint {
     }
 
     /**
-     * EV = (n parcels × reward × multiplier × decay factor) − (standard points earned in same time).
+     * Compare the SAME n parcels two ways:
+     *  - mission: hold all n while collecting (more decay), deliver once with multiplier m.
+     *  - standard: deliver each as collected (less decay), no multiplier.
+     * With m < 1 the mission always loses (penalty) → EV < 0 → reject. With m ≥ ~1 it can win.
      * @param {{ type:string, n?:number, min?:number, multiplier?:number }} params
-     * @param {{ avgReward:number, avgCollectTime:number, decay:number, pps:number }} stats
+     * @param {{ avgReward:number, avgCollectTime:number, decay:number }} stats
      * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'stack') return null;
         const n = params.n ?? params.min ?? 3;
         const m = params.multiplier ?? 1;
-        const { avgReward, avgCollectTime, decay, pps } = stats;
-        const tempoTotale = n * avgCollectTime;
-        const decayMedio = Math.min(0.99, decay * (n / 2) * avgCollectTime);
-        const guadagnoMissione = n * avgReward * m * (1 - decayMedio);
-        const guadagnoStandard = pps * tempoTotale;
+        const { avgReward, avgCollectTime, decay } = stats;
+        // Stacking holds parcels ~n/2 collect-cycles on average; standard delivery ~0.5.
+        const decayStack = Math.min(0.99, decay * (n / 2) * avgCollectTime);
+        const decayStd   = Math.min(0.99, decay * 0.5 * avgCollectTime);
+        const guadagnoMissione = n * avgReward * m * (1 - decayStack);
+        const guadagnoStandard = n * avgReward * 1 * (1 - decayStd);
         return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
     }
 }
