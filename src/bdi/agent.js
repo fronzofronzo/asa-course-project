@@ -12,6 +12,7 @@ const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
 const UTILITY_THRESHOLD = parseFloat(process.env.UTILITY_THRESHOLD) || 0;
 const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
 const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; // ms between re-deliberation
+const RENDEZVOUS_DWELL_MS = parseInt(process.env.RENDEZVOUS_DWELL_MS) || 3000; // hold at rendezvous before master signals resume
 
 const PEER_AGENT_NAME = process.env.PEER_AGENT_NAME ?? null;
 const AGENT_ROLE     = process.env.AGENT_ROLE ?? 'master'; // 'master' | 'slave'
@@ -342,6 +343,22 @@ async function agentLoop() {
                     agent.beliefs.missionConstraints.redLight.set(true);
                     sendToPeer({ type: 'coord_status', mission: 'meet_and_wait', event: 'arrived' });
                     console.log(`[COORD] Arrived at rendezvous (${agent.x},${agent.y}) dist=${dist} — freezing`);
+                }
+            }
+
+            // Master auto-releases the rendezvous once BOTH agents have arrived.
+            // Dwell briefly so the server registers the mutual wait (500pt bonus), then signal resume to the slave.
+            if (AGENT_ROLE === 'master' && coord.rendezvous && coord.rendezvous.selfArrived && coord.rendezvous.peerArrived) {
+                const r = coord.rendezvous;
+                if (!r.bothArrivedAt) {
+                    r.bothArrivedAt = Date.now();
+                    console.log('[COORD] Both agents at rendezvous — holding before resume');
+                } else if (Date.now() - r.bothArrivedAt >= RENDEZVOUS_DWELL_MS) {
+                    console.log('[COORD] Rendezvous complete — master signalling resume to peer, both resuming');
+                    sendToPeer({ type: 'coord_cmd', mission: 'release_coordination' });
+                    agent.beliefs.missionConstraints.redLight.set(false);
+                    agent.beliefs.missionConstraints.coordination.reset();
+                    agent._notifyBeliefChanged();
                 }
             }
 
