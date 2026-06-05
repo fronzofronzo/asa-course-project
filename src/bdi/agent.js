@@ -242,31 +242,10 @@ async function agentLoop() {
 
         } else if (agent.intention?.type === 'PICKUP') {
             const p = agent.intention.parcel;
-            const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
-            const onParcel = isStable && agent.x === p.x && agent.y === p.y;
+            const onParcel = () => Number.isInteger(agent.x) && Number.isInteger(agent.y)
+                && agent.x === p.x && agent.y === p.y;
 
-            if (onParcel) {
-                console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
-                const pickedUp = await agent.socket.emitPickup();
-                if (pickedUp?.length > 0) {
-                    const stackMax = agent.beliefs.missionConstraints?.stack?.max ?? null;
-                    const newTotal = carriedCount + pickedUp.length;
-                    if (stackMax !== null && newTotal > stackMax) {
-                        // emitPickup grabbed more than stack.max allows — drop excess immediately
-                        const excess = newTotal - stackMax;
-                        const toDrop = pickedUp.slice(pickedUp.length - excess).map(q => q.id);
-                        await agent.socket.emitPutdown(toDrop);
-                        console.log(`[STACK] Picked up ${pickedUp.length}, dropped ${toDrop.length} excess to stay at max=${stackMax}`);
-                    } else {
-                        console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);
-                    }
-                    agent.intention = null;
-                    agent.stuckCount = 0;
-                } else {
-                    console.warn(`[EXECUTE] ✗ Pickup failed at (${p.x},${p.y}) - parcel may be gone`);
-                    agent.intention = null;
-                }
-            } else {
+            if (!onParcel()) {
                 console.log(`[EXECUTE] Moving to parcel ${p.id} at (${p.x},${p.y}) (${Math.round(Math.sqrt((p.x - agent.x) ** 2 + (p.y - agent.y) ** 2))} steps away)`);
                 const status = await stepToward(p, agent);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
@@ -288,6 +267,30 @@ async function agentLoop() {
                     }
                 } else {
                     agent.stuckCount = 0;
+                }
+            }
+
+            // runs if already on parcel at start of iteration OR just landed this step
+            if (onParcel() && agent.intention?.type === 'PICKUP') {
+                console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
+                const pickedUp = await agent.socket.emitPickup();
+                if (pickedUp?.length > 0) {
+                    const stackMax = agent.beliefs.missionConstraints?.stack?.max ?? null;
+                    const newTotal = carriedCount + pickedUp.length;
+                    if (stackMax !== null && newTotal > stackMax) {
+                        // emitPickup grabbed more than stack.max allows — drop excess immediately
+                        const excess = newTotal - stackMax;
+                        const toDrop = pickedUp.slice(pickedUp.length - excess).map(q => q.id);
+                        await agent.socket.emitPutdown(toDrop);
+                        console.log(`[STACK] Picked up ${pickedUp.length}, dropped ${toDrop.length} excess to stay at max=${stackMax}`);
+                    } else {
+                        console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);
+                    }
+                    agent.intention = null;
+                    agent.stuckCount = 0;
+                } else {
+                    console.warn(`[EXECUTE] ✗ Pickup failed at (${p.x},${p.y}) - parcel may be gone`);
+                    agent.intention = null;
                 }
             }
 
