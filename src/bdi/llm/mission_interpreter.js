@@ -364,6 +364,10 @@ COORDINATION MISSION SETUP (TYPE 3 — master role only):
 RULE 1 — Always call get_agent_state first.
 
 RULE 2 — GOTO mission ("move to (x,y) and get +N pts"):
+  - This rule applies ONLY when the message rewards GOING to a tile.
+  - A message about what happens when you DELIVER at a tile ("deliver in (x,y) and you get 0 pts",
+    "no reward / penalty when delivering at (x,y)") is NOT a GOTO — it is a BLACKLIST mission → use RULE 4
+    with {"type":"blacklist"}. Do NOT reject it as zero-reward.
   - If coordinates contain math (e.g. x=4*2), call calculate first.
   - If reward > 0: call set_tile_utility, then Final Answer.
   - If reward ≤ 0: Final Answer "Mission rejected: negative/zero reward".
@@ -419,12 +423,28 @@ Final Answer: <outcome summary>
 Never output Action and Final Answer in the same message. Never write "Action: None". Do not invent tool results.
 `.trim()
 
+// ─── Slave directive ──────────────────────────────────────────────────────────
+
+const SLAVE_DIRECTIVE = `
+You are the SLAVE agent. The MASTER orchestrates ALL TYPE 3 COORDINATION missions that
+involve both agents acting together: "meet at (x,y)" (meet_and_wait), "parcel handoff
+between agents" (parcel_handoff), and "all agents freeze on odd row" (odd_row_wait).
+If the message is one of these coordination missions, do NOT call any setup tool and do NOT
+call evaluate_mission — the master will command you via the peer channel. Respond with:
+Final Answer: "Coordination mission — deferring to master; awaiting peer commands."
+Handle everything else yourself, normally and independently: TYPE 1 (atomic GOTO / questions)
+and TYPE 2 (stack, preferred tile, blacklist, reward cap, forbidden tile, single-agent
+red-light/stop). A plain "stop/freeze until I say go" (red_light, RULE 7) is NOT coordination
+— handle it yourself by freezing your own movement.
+`.trim()
+
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 export async function interpretMission(
     senderName, msg, beliefs, getState, replyFn,
     getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 }),
-    coordinationCtx = null
+    coordinationCtx = null,
+    role = 'master'
 ) {
     if (!client) {
         logLLM('[MissionInterpreter] No LLM client — skipping mission interpretation')
@@ -456,6 +476,7 @@ export async function interpretMission(
 
     const messages = [
         { role: 'system', content: MISSION_SYSTEM_PROMPT },
+        ...(role === 'slave' ? [{ role: 'system', content: SLAVE_DIRECTIVE }] : []),
         { role: 'user',   content: `[MISSION from ${senderName}]: "${msg}"` },
     ]
 

@@ -2,6 +2,7 @@ import 'dotenv/config'
 import { BeliefSet } from './belief.js';
 import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
 import { nearestDeliveryTile, computeBestSpawnTile } from './planner.js';
+import { getEffectiveDeliveryTiles } from './utils.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
 import { log, setLoggerName } from './logger.js';
@@ -142,12 +143,16 @@ async function drainMissions() {
                         pointsPerSecond: agent.score / Math.max(1, elapsed),
                     };
                 },
-                {
-                    sendToPeer: (msg) => sendToPeer(msg),
-                    getPeerAgentId: () => peerAgentId,
-                    findNearestOddRowTile: () => findNearestOddRowTile(),
-                    notifyBeliefChanged: () => agent._notifyBeliefChanged(),
-                }
+                // master: full ctx (orchestrates L3); slave: no sendToPeer → L3 master-tools no-op, freeze stays local
+                AGENT_ROLE === 'master'
+                    ? {
+                        sendToPeer: (msg) => sendToPeer(msg),
+                        getPeerAgentId: () => peerAgentId,
+                        findNearestOddRowTile: () => findNearestOddRowTile(),
+                        notifyBeliefChanged: () => agent._notifyBeliefChanged(),
+                    }
+                    : { notifyBeliefChanged: () => agent._notifyBeliefChanged() },
+                AGENT_ROLE
             );
         } finally {
             llmBusy = false;
@@ -265,18 +270,13 @@ agent.socket.onMsg(async (senderId, name, msg, ack) => {
         if (ack) try { ack('ok'); } catch {}
         return;
     }
-    // Slave ignores all non-peer messages — only master interprets admin missions
-    if (AGENT_ROLE === 'slave') {
-        console.log(`[SLAVE] Ignoring message from ${name} (slave role — contact master)`);
-        if (ack) try { ack(`slave: send missions to master agent`); } catch {}
-        return;
-    }
+    // Both roles interpret admin missions; slave defers L3 coordination to master (handled in LLM prompt)
     if (name !== MISSION_SENDER) {
         console.log(`[MISSION] Ignored message from ${name} (not ${MISSION_SENDER})`);
         if (ack) try { ack('ignored'); } catch {}
         return;
     }
-    console.log(`\n[MISSION] Message from ${name}: ${msg}`);
+    console.log(`\n[MISSION] (${AGENT_ROLE}) Message from ${name}: ${msg}`);
     // Works for both emitAsk (ack replies to caller) and emitSay (emitSay sends a new message)
     const replyFn = (message) => {
         if (ack) try { ack(message); } catch {}
@@ -388,7 +388,9 @@ async function agentLoop() {
         // --- execution (continuous, one step per iteration) ---
         if (agent.intention?.type === 'DELIVER') {
             console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
-            const onDelivery = agent.beliefs.map.deliveryTiles
+            // Use blacklist/preferred-filtered tiles: never count a blacklisted tile as a valid drop spot
+            const effectiveDelivery = getEffectiveDeliveryTiles(agent.beliefs.map.deliveryTiles, agent.beliefs.missionConstraints ?? null);
+            const onDelivery = effectiveDelivery
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
             if (onDelivery) {
@@ -417,7 +419,15 @@ async function agentLoop() {
                     console.log(`[EXECUTE] Moving to delivery (${target.x},${target.y})`);
                     const status = await stepToward(target, agent);
                     console.log(`[EXECUTE] Move result: ${status} now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                    if (status === 'stuck') agent.stuckCount++;
+                    if (status === 'unreachable') {
+                        // No path at all (e.g. forbidden/blocked destination): abandon this tile now, re-pick another
+                        console.warn(`[UNREACHABLE] No path to delivery (${target.x},${target.y}) - marking unreachable, re-deliberating`);
+                        unreachableDeliveryTiles.set(`${target.x},${target.y}`, Date.now());
+                        agent.stuckCount = 0;
+                        agent.needsDeliberation = true;
+                    } else if (status === 'stuck') {
+                        agent.stuckCount++;
+                    }
                     if (agent.stuckCount > 5) {
                         console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach delivery at (${target.x},${target.y}) - marking as unreachable`);
                         unreachableDeliveryTiles.set(`${target.x},${target.y}`, Date.now());
@@ -494,7 +504,12 @@ async function agentLoop() {
             } else {
                 const status = await stepToward(gotoTile, agent);
                 console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
-                if (status === 'stuck') {
+                if (status === 'unreachable') {
+                    console.warn(`[UNREACHABLE] No path to GOTO tile (${gotoTile.x},${gotoTile.y}) - abandoning`);
+                    agent.beliefs.tileUtilities.delete(gotoKey);
+                    agent.intention = null;
+                    agent.stuckCount = 0;
+                } else if (status === 'stuck') {
                     agent.stuckCount++;
                     console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach GOTO tile (${gotoTile.x},${gotoTile.y})`);
                     if (agent.stuckCount > 5) {
