@@ -181,7 +181,7 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
         [...knownAgents.values()].map(a => `${Math.round(a.x)},${Math.round(a.y)}`)
     );
     for (const key of forbiddenTiles) blocked.add(key);
-    blocked.delete(startKey);
+    blocked.delete(goalKey);
     if (blocked.size > 0) {
         console.log(`[PATHFIND] ${blocked.size} tile(s) blocking (agents + forbidden)`);
     }
