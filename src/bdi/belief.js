@@ -15,9 +15,11 @@ class BeliefSet {
             walkable: new Set(),   // Set of `${x},${y}` strings
             exitDirs: new Map(),   // key: `${x},${y}` → Set of allowed exit directions ('up'|'down'|'left'|'right'); absent = all directions allowed
             spawnHeat: new Map(),  // key: `${x},${y}` → heat value (0-1)
+            pushTargets: new Set(),// `${x},${y}` of crate-pushable (yellow) cells: tile type '5' / '5!'
         };
         this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
         this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
+        this.crates  = new Map();  // id → { id, x, y } — pushable obstacles (Sokoban-style)
         this.tileUtilities = new Map(); // "x,y" → number (LLM-injected tile goals)
         this.missionConstraints = new MissionConstraints();
     }
@@ -82,10 +84,31 @@ class BeliefSet {
         }
     }
 
-     updateBeliefs({ agents, parcels }) {
-      const before = new Set(this.parcels.keys());                                                                                                                                                                      
+    /**
+     * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOCrate').IOCrate[]} crates
+     */
+    updateCrates(crates) {
+        // Crates are static obstacles: upsert by id (refreshes position, incl. our own
+        // pushes — same id, new cell) and PERSIST when out of sensing range. Pruning on
+        // unseen made crateCells flicker as the agent moved, flipping the A* blocked set
+        // and causing navigation livelock. Cleared on new map (updateMap).
+        for (const c of crates) {
+            this.crates.set(c.id, { id: c.id, x: Math.round(c.x), y: Math.round(c.y) });
+        }
+    }
+
+    /** @returns {Set<string>} "x,y" keys currently occupied by a crate */
+    crateCells() {
+        const s = new Set();
+        for (const c of this.crates.values()) s.add(`${c.x},${c.y}`);
+        return s;
+    }
+
+     updateBeliefs({ agents, parcels, crates }) {
+      const before = new Set(this.parcels.keys());
       this.updateAgents(agents);
       this.updateParcels(parcels);
+      this.updateCrates(crates ?? []);
       const after = new Set(this.parcels.keys());                                                                                                                                                                       
    
       const newParcels = [...after]                                                                                                                                                                                     
@@ -161,6 +184,8 @@ updateMap(width, height, tiles) {
     this.map.spawnTiles = [];
     this.map.walkable.clear();
     this.map.exitDirs.clear();
+    this.map.pushTargets.clear();
+    this.crates.clear();
 
     const ARROW_DIR = { '↑': 'up', '↓': 'down', '←': 'left', '→': 'right' };
 
@@ -172,6 +197,8 @@ updateMap(width, height, tiles) {
 
         this.map.walkable.add(key);
         console.log(tile.type)
+        // crate sliding tile / spawner: the only cells a crate may be pushed onto (yellow)
+        if (tile.type === '5' || tile.type === '5!') this.map.pushTargets.add(key);
         if (tile.type == 2) this.map.deliveryTiles.push(tile);
         if (tile.type == 1) {
             console.log("Questa è una spawining tile")

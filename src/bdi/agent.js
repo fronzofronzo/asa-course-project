@@ -97,8 +97,8 @@ agent.socket.onYou(({id, name, x, y, score}) => {
     agent.gameStats.lastScore = score;
     agent.updateInformation(id, name, x, y, score);
 })
-agent.socket.onSensing(({ agents, parcels }) => {
-    agent.beliefs.updateBeliefs({ agents, parcels });
+agent.socket.onSensing(({ agents, parcels, crates }) => {
+    agent.beliefs.updateBeliefs({ agents, parcels, crates });
     if (agent.x !== null) {
         agent.beliefs.updateParcelUncertainty({ x: agent.x, y: agent.y });
     }

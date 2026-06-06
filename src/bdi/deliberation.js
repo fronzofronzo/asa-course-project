@@ -1,4 +1,5 @@
 import { bfsDist, getEffectiveDeliveryTiles } from './utils.js';
+import { planCrateMove, actionToDirection } from './PDDL/pddl_planner.js';
 
 /**
  * Nearest delivery tile distance from a given position.
@@ -162,7 +163,7 @@ function filterIntentions(desires, currentIntention, epsilon) {
  * @param {Map<string, object>} knownAgents  belief agents (their tiles are avoided)
  * @returns {string[] | null}
  */
-function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles = new Set()) {
+function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles = new Set(), crateCells = new Set()) {
     const sx = Math.round(from.x), sy = Math.round(from.y);
     const gx = to.x, gy = to.y;
     const startKey = `${sx},${sy}`;
@@ -182,9 +183,10 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
         [...knownAgents.values()].map(a => `${Math.round(a.x)},${Math.round(a.y)}`)
     );
     for (const key of forbiddenTiles) blocked.add(key);
+    for (const key of crateCells) blocked.add(key); // crates block A*; PDDL fallback pushes them
     blocked.delete(goalKey);
     if (blocked.size > 0) {
-        console.log(`[PATHFIND] ${blocked.size} tile(s) blocking (agents + forbidden)`);
+        console.log(`[PATHFIND] ${blocked.size} tile(s) blocking (agents + forbidden + crates)`);
     }
 
     const h = (x, y) => Math.abs(x - gx) + Math.abs(y - gy);
@@ -301,19 +303,77 @@ async function stepToward(target, agent) {
     }
     
     const forbidden = agent.beliefs.missionConstraints?.forbidden.tiles ?? new Set();
+    const crateCells = agent.beliefs.crateCells?.() ?? new Set();
     const path = computePath(
         { x: agent.x, y: agent.y },
         target,
         agent.beliefs.map.walkable,
         agent.beliefs.map.exitDirs,
         agent.beliefs.agents,
-        forbidden
+        forbidden,
+        crateCells
     );
 
     if (path === null) {
+        // A* failed. Is a crate the blocker? If a path exists when we ignore crates,
+        // a crate stands in the way → ask the PDDL planner to push it (Sokoban-style).
+        if (crateCells.size > 0) {
+            const pathNoCrates = computePath(
+                { x: agent.x, y: agent.y }, target,
+                agent.beliefs.map.walkable, agent.beliefs.map.exitDirs,
+                agent.beliefs.agents, forbidden /* no crates */
+            );
+            if (pathNoCrates !== null) {
+                const goalKey = `${target.x},${target.y}`;
+                // The online solver is slow (network). Solve ONCE per crate situation and
+                // cache the move/push sequence; execute it step by step without re-solving.
+                let cache = agent._cratePlan;
+                if (!cache || cache.goalKey !== goalKey || cache.dirs.length === 0) {
+                    console.log(`[PDDL] crate blocks path to (${target.x},${target.y}) — planning push`);
+                    const plan = await planCrateMove(agent.beliefs, { x: agent.x, y: agent.y }, target);
+                    const dirs = (plan ?? []).map(actionToDirection).filter(Boolean);
+                    if (dirs.length === 0) {
+                        agent._cratePlan = null;
+                        console.warn(`[PDDL] no push plan — ✗ No path from (${Math.round(agent.x)},${Math.round(agent.y)}) to (${target.x},${target.y})`);
+                        return 'unreachable';
+                    }
+                    cache = agent._cratePlan = { goalKey, dirs };
+                    console.log(`[PDDL] plan cached (${dirs.length} steps): [${dirs.slice(0, 8).join(',')}${dirs.length > 8 ? '...' : ''}]`);
+                }
+                // Drain the whole push plan in one commit. Pace by movement_duration so the
+                // moves don't outrun the server (drift).
+                console.log(`[PDDL] executing cached plan (${cache.dirs.length} steps)`);
+                const moveDur = agent.gameConfig?.player?.movement_duration ?? 500;
+                while (cache.dirs.length > 0) {
+                    const dir = cache.dirs[0];
+                    let result;
+                    try {
+                        result = await agent.socket.emitMove(dir);
+                    } catch (e) {
+                        agent._cratePlan = null;
+                        console.warn(`[PDDL] move ${dir} threw: ${e.message} — invalidating plan`);
+                        return 'stuck';
+                    }
+                    if (result === false) {
+                        agent._cratePlan = null;
+                        console.warn(`[PDDL] push/move ${dir} failed — invalidating plan`);
+                        return 'stuck';
+                    }
+                    cache.dirs.shift();
+                    agent.x = result.x;
+                    agent.y = result.y;
+                    if (cache.dirs.length > 0) await new Promise(r => setTimeout(r, moveDur));
+                }
+                agent._cratePlan = null;
+                if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
+                return 'moved';
+            }
+        }
         console.warn(`[PATHFIND] ✗ No path from (${Math.round(agent.x)},${Math.round(agent.y)}) to (${target.x},${target.y})`);
         return 'unreachable';
     }
+    // Normal A* path available → no crate blocking; drop any stale push plan.
+    if (agent._cratePlan) agent._cratePlan = null;
     if (path.length === 0) {
         console.log(`[PATHFIND] ✓ Already at target (${target.x},${target.y})`);
         return 'arrived';
