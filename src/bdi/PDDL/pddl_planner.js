@@ -22,6 +22,23 @@ const DIRS = [
     { dir: 'Right', dx: 1,  dy: 0  },
 ];
 
+const DIR_DELTA = Object.fromEntries(DIRS.map(d => [d.dir.toLowerCase(), { dx: d.dx, dy: d.dy }]));
+
+/**
+ * Canonical cell stepping for a direction (right=x+1, left=x-1, up=y+1, down=y-1).
+ * Returns the cell the agent enters (`enter`) and the cell one further in the same
+ * direction (`beyond`) — i.e. where a pushed crate would slide to.
+ * @param {{x:number,y:number}} from
+ * @param {'up'|'down'|'left'|'right'} dir
+ * @returns {{enter:{x:number,y:number}, beyond:{x:number,y:number}}|null}
+ */
+export function stepCells(from, dir) {
+    const d = DIR_DELTA[dir];
+    if (!d) return null;
+    const ex = Math.round(from.x) + d.dx, ey = Math.round(from.y) + d.dy;
+    return { enter: { x: ex, y: ey }, beyond: { x: ex + d.dx, y: ey + d.dy } };
+}
+
 /**
  * Build a PDDL problem string from the current beliefs.
  * Cells = walkable tiles (c_x_y). Neighbour facts only between walkable cells
@@ -29,9 +46,10 @@ const DIRS = [
  * @param {import('../belief.js').BeliefSet} beliefs
  * @param {{x:number,y:number}} from  agent start (rounded)
  * @param {{x:number,y:number}} to    goal cell
+ * @param {Set<string>} excludedSpawns  "x,y" cells barred as crate slide targets (would self-block the path)
  * @returns {string}
  */
-export function buildProblem(beliefs, from, to) {
+export function buildProblem(beliefs, from, to, excludedSpawns = new Set()) {
     const walkable = beliefs.map.walkable;
     const exitDirs = beliefs.map.exitDirs;
     const pushTargets = beliefs.map.pushTargets ?? new Set();
@@ -53,8 +71,10 @@ export function buildProblem(beliefs, from, to) {
         }
     }
 
-    // Crates may only be pushed onto yellow crate cells.
+    // Crates may only be pushed onto yellow crate cells. Cells that would self-block
+    // the agent's route to the goal are excluded, forcing the planner to push aside.
     for (const key of pushTargets) {
+        if (excludedSpawns.has(key)) continue;
         const [x, y] = key.split(',').map(Number);
         init.push(`(crate-spawn ${cellName(x, y)})`);
     }
@@ -82,8 +102,8 @@ export function buildProblem(beliefs, from, to) {
  * Plan a path that may push crates out of the way.
  * @returns {Promise<Array<{action:string,args:string[]}>|null>} plan steps or null
  */
-export async function planCrateMove(beliefs, from, to) {
-    const problem = buildProblem(beliefs, from, to);
+export async function planCrateMove(beliefs, from, to, excludedSpawns = new Set()) {
+    const problem = buildProblem(beliefs, from, to, excludedSpawns);
     try {
         const plan = await onlineSolver(getDomain(), problem);
         if (!plan || plan.length === 0) return null;

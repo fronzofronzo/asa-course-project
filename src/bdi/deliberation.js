@@ -1,6 +1,46 @@
 import { bfsDist, getEffectiveDeliveryTiles } from './utils.js';
 import { planCrateMove, actionToDirection } from './PDDL/pddl_planner.js';
 
+// Exponential backoff for failed crate-push plans, keyed by goal "x,y".
+// Stops the agent from re-running the ~9s online solve every cycle on an
+// unsolvable snapshot (livelock). base 3s, doubling, capped at 30s.
+const CRATE_BACKOFF_BASE_MS = 3000;
+const CRATE_BACKOFF_CAP_MS = 30000;
+const CRATE_MAX_INCALL_REPLANS = 2;
+
+/** Parse a PDDL cell object name "c_8_4" into {x:8,y:4}. */
+function parseCell(name) {
+    const [, x, y] = String(name).toLowerCase().split('_');
+    return { x: Number(x), y: Number(y) };
+}
+
+/**
+ * Validate a planned PDDL step against current beliefs, driven by the step's declared
+ * action (not by guessing from beliefs). A PDDL plan provably reaches the goal, so the
+ * only thing that can break it is the live world having drifted from the solve snapshot.
+ * Returns true if the step's preconditions still hold and it can be emitted now.
+ */
+function planStepValid(beliefs, step) {
+    const a = String(step?.action ?? '').toLowerCase();
+    const walkable = beliefs.map.walkable;
+    const crates = beliefs.crateCells?.() ?? new Set();
+    const pushTargets = beliefs.map.pushTargets ?? new Set();
+
+    if (a.startsWith('move-')) {
+        const d = parseCell(step.args[1]);
+        const k = `${d.x},${d.y}`;
+        return walkable.has(k) && !crates.has(k);
+    }
+    if (a.startsWith('push-')) {
+        const c = parseCell(step.args[1]); // crate's current cell
+        const d = parseCell(step.args[2]); // crate's destination
+        const ck = `${c.x},${c.y}`;
+        const dk = `${d.x},${d.y}`;
+        return crates.has(ck) && walkable.has(dk) && pushTargets.has(dk) && !crates.has(dk);
+    }
+    return false;
+}
+
 /**
  * Nearest delivery tile distance from a given position.
  * @param {{ x:number, y:number }} pos
@@ -325,46 +365,103 @@ async function stepToward(target, agent) {
             );
             if (pathNoCrates !== null) {
                 const goalKey = `${target.x},${target.y}`;
-                // The online solver is slow (network). Solve ONCE per crate situation and
-                // cache the move/push sequence; execute it step by step without re-solving.
-                let cache = agent._cratePlan;
-                if (!cache || cache.goalKey !== goalKey || cache.dirs.length === 0) {
-                    console.log(`[PDDL] crate blocks path to (${target.x},${target.y}) — planning push`);
+                const failures = (agent._cratePlanFailures ??= new Map());
+
+                // Backoff: don't re-run the ~9s online solve every cycle on a dead snapshot.
+                const back = failures.get(goalKey);
+                if (back && Date.now() < back.until && (!agent._cratePlan || agent._cratePlan.goalKey !== goalKey)) {
+                    console.warn(`[PDDL] backoff ${goalKey} (${Math.ceil((back.until - Date.now()) / 1000)}s left) — skipping solve`);
+                    return 'unreachable';
+                }
+
+                const noteFailure = () => {
+                    const prev = failures.get(goalKey) ?? { count: 0 };
+                    const count = prev.count + 1;
+                    const wait = Math.min(CRATE_BACKOFF_BASE_MS * 2 ** (count - 1), CRATE_BACKOFF_CAP_MS);
+                    failures.set(goalKey, { count, until: Date.now() + wait });
+                };
+
+                // The online solver is slow (network). Solve once and cache the FULL plan
+                // steps (action + cells), so we can validate each step by its declared
+                // intent (MOVE vs PUSH) against live beliefs before emitting.
+                const solveFromHere = async () => {
+                    console.log(`[PDDL] crate blocks path to (${target.x},${target.y}) — planning push from (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     const plan = await planCrateMove(agent.beliefs, { x: agent.x, y: agent.y }, target);
-                    const dirs = (plan ?? []).map(actionToDirection).filter(Boolean);
-                    if (dirs.length === 0) {
+                    const steps = (plan ?? []).filter(s => actionToDirection(s));
+                    if (steps.length === 0) return null;
+                    const c = agent._cratePlan = { goalKey, steps };
+                    const preview = steps.slice(0, 8).map(actionToDirection).join(',');
+                    console.log(`[PDDL] plan cached (${steps.length} steps): [${preview}${steps.length > 8 ? '...' : ''}]`);
+                    return c;
+                };
+
+                let cache = agent._cratePlan;
+                if (!cache || cache.goalKey !== goalKey || cache.steps.length === 0) {
+                    cache = await solveFromHere();
+                    if (!cache) {
                         agent._cratePlan = null;
+                        noteFailure();
                         console.warn(`[PDDL] no push plan — ✗ No path from (${Math.round(agent.x)},${Math.round(agent.y)}) to (${target.x},${target.y})`);
                         return 'unreachable';
                     }
-                    cache = agent._cratePlan = { goalKey, dirs };
-                    console.log(`[PDDL] plan cached (${dirs.length} steps): [${dirs.slice(0, 8).join(',')}${dirs.length > 8 ? '...' : ''}]`);
                 }
-                // Drain the whole push plan in one commit. Pace by movement_duration so the
-                // moves don't outrun the server (drift).
-                console.log(`[PDDL] executing cached plan (${cache.dirs.length} steps)`);
+
+                // Drain the plan faithfully. A PDDL plan provably reaches the goal, so a
+                // crate can never be left blocking us. The only failure mode is the live
+                // world having drifted from the solve snapshot (e.g. a crate sensed mid-route
+                // on a cell the plan assumed empty) → re-solve from the current position;
+                // the fresh plan naturally pushes that crate aside.
                 const moveDur = agent.gameConfig?.player?.movement_duration ?? 500;
-                while (cache.dirs.length > 0) {
-                    const dir = cache.dirs[0];
+                let replans = 0;
+                let progressed = false;
+                const yieldOrFail = () => {
+                    if (progressed) return 'moved';        // made headway — BDI re-enters and continues
+                    noteFailure();                          // stuck with no progress — arm backoff
+                    return 'unreachable';
+                };
+                while (cache.steps.length > 0) {
+                    const step = cache.steps[0];
+                    const dir = actionToDirection(step);
+
+                    // Step's planned precondition no longer holds in live beliefs → re-solve.
+                    if (!planStepValid(agent.beliefs, step)) {
+                        agent._cratePlan = null;
+                        if (replans++ >= CRATE_MAX_INCALL_REPLANS) {
+                            console.warn(`[PDDL] step ${step.action} diverged, replan budget spent — yielding`);
+                            return yieldOrFail();
+                        }
+                        console.warn(`[PDDL] step ${step.action} diverged from beliefs — re-solving from (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                        cache = await solveFromHere();
+                        if (!cache) return yieldOrFail();
+                        continue;
+                    }
+
                     let result;
                     try {
                         result = await agent.socket.emitMove(dir);
                     } catch (e) {
-                        agent._cratePlan = null;
-                        console.warn(`[PDDL] move ${dir} threw: ${e.message} — invalidating plan`);
-                        return 'stuck';
+                        console.warn(`[PDDL] move ${dir} threw: ${e.message}`);
+                        result = false;
                     }
                     if (result === false) {
                         agent._cratePlan = null;
-                        console.warn(`[PDDL] push/move ${dir} failed — invalidating plan`);
-                        return 'stuck';
+                        if (replans++ >= CRATE_MAX_INCALL_REPLANS) {
+                            console.warn(`[PDDL] ${step.action} rejected by server, replan budget spent — yielding`);
+                            return yieldOrFail();
+                        }
+                        console.warn(`[PDDL] ${step.action} rejected by server — re-solving from (${Math.round(agent.x)},${Math.round(agent.y)})`);
+                        cache = await solveFromHere();
+                        if (!cache) return yieldOrFail();
+                        continue;
                     }
-                    cache.dirs.shift();
+                    cache.steps.shift();
                     agent.x = result.x;
                     agent.y = result.y;
-                    if (cache.dirs.length > 0) await new Promise(r => setTimeout(r, moveDur));
+                    progressed = true;
+                    if (cache.steps.length > 0) await new Promise(r => setTimeout(r, moveDur));
                 }
                 agent._cratePlan = null;
+                failures.delete(goalKey); // plan fully executed — clear backoff
                 if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
                 return 'moved';
             }
