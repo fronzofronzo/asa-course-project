@@ -152,13 +152,26 @@ function blacklistDeliveryTile(input, beliefs) {
 
 function setRewardCap(input, beliefs) {
     try {
-        // ReAct passes Action Input verbatim — a quoted "10" arrives as the literal string '"10"'.
-        // Strip surrounding quotes/whitespace before parsing so parseFloat doesn't choke on the quotes.
+        // Accept a bare number ("10") or a JSON object {"cap":N,"mode":"single|stack","gate":"sum|each"}.
+        // ReAct passes Action Input verbatim — a quoted "10" arrives as the literal string '"10"'; strip
+        // surrounding quotes/whitespace first so JSON.parse/parseFloat don't choke on them.
         const cleaned = String(input).trim().replace(/^["']|["']$/g, '')
-        const cap = parseFloat(cleaned)
+        let cap, mode = null, gate = null
+        let parsed
+        try { parsed = JSON.parse(cleaned) } catch { parsed = parseFloat(cleaned) }
+        if (typeof parsed === 'number') {
+            cap = parsed
+        } else if (parsed && typeof parsed === 'object') {
+            cap = parseFloat(parsed.cap)
+            mode = parsed.mode ?? null
+            gate = parsed.gate ?? null
+        } else {
+            cap = parseFloat(cleaned)
+        }
         if (isNaN(cap) || cap <= 0) return 'Error: cap must be a positive number'
-        beliefs.missionConstraints.rewardCap.set(cap)
-        return `Reward cap set: skip parcels with reward > ${cap}`
+        beliefs.missionConstraints.rewardCap.set(cap, mode, gate)
+        const rc = beliefs.missionConstraints.rewardCap
+        return `Reward cap set: cap=${cap} mode=${rc.mode} gate=${rc.gate} (deliver when ${rc.gate === 'each' ? 'each parcel' : 'carried total'} <= ${cap}; prefer cheap, hold & decay expensive)`
     } catch (e) {
         return `Error: ${e.message}`
     }
@@ -353,6 +366,11 @@ INTERMEDIATE MISSION EVALUATION:
        The stated points are a flat one-shot "bonus", NOT a multiplier — never put 1000 in "multiplier".
    - {"type":"blacklist"}
    - {"type":"reward_cap", "cap":10}
+       Infer two strategy knobs from the wording, to pass to set_reward_cap:
+       gate = "each" if the cap applies to EACH/EVERY parcel ("each parcel <= N", "parcels worth <= N");
+              "sum"  if it applies to the TOTAL/combined ("total <= N", "sum of rewards <= N").
+       mode = "stack" if delivering several qualifying parcels together is rewarded/implied; else "single".
+       If the wording is silent, omit mode/gate (defaults apply).
    - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
    - {"type":"red_light", "bonus":10000}
    - {"type":"meet_and_wait", "bonus":500, "x":N, "y":N, "wait_seconds":10}   — include target coords so EV accounts for travel time
@@ -363,7 +381,7 @@ INTERMEDIATE MISSION SETUP (call ONLY after evaluate_mission recommends ACCEPT):
 6. set_stack_requirement — Input: {"min":N or null, "max":N or null}
 7. set_preferred_delivery_tiles — Input: {"tiles":[{"x":N,"y":N},...], "multiplier":M}
 8. blacklist_delivery_tile — Input: {"x":N,"y":N}
-9. set_reward_cap — Input: number string, e.g. "10.5"
+9. set_reward_cap — Input: {"cap":N, "mode":"single"|"stack", "gate":"sum"|"each"} (mode/gate optional; bare number "10" also accepted)
 10. add_forbidden_tile — Input: {"x":N,"y":N}
 11. set_movement_freeze — Input: "true" or "false" — freeze/unfreeze movement; also relays to peer if coordination active
 12. get_mission_state — Input: "" — Returns current constraints snapshot

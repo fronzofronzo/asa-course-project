@@ -307,7 +307,8 @@ async function agentLoop() {
 
         // --- deliberation (periodic, on belief change, or when intention just cleared) ---
         if (agent.shouldDeliberate() || agent.intention == null) {
-            console.log(`\n[DELIBERATION] at (${Math.round(agent.x)},${Math.round(agent.y)}) | carried=${carriedCount} reward=${carriedReward.toFixed(1)}`);
+            const carriedBreakdown = agent.carriedParcels.map(p => `${p.id}:${p.reward.toFixed(1)}`).join(', ');
+            console.log(`\n[DELIBERATION] at (${Math.round(agent.x)},${Math.round(agent.y)}) | carried=${carriedCount} reward=${carriedReward.toFixed(1)}${carriedCount > 0 ? ` [${carriedBreakdown}]` : ''}`);
             console.log(`[DELIBERATION] Found ${desires.length} viable parcel(s)`);
             if (desires.length > 0) {
                 console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.id} type=${d.type} U=${d.utility.toFixed(1)})`).join(' | ')}`);
@@ -411,8 +412,13 @@ async function agentLoop() {
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
             if (onDelivery) {
+                const rewardCap = agent.beliefs.missionConstraints?.rewardCap;
                 const stackMin = agent.beliefs.missionConstraints?.stack?.min ?? null;
-                if (stackMin !== null && carriedCount < stackMin) {
+                if (rewardCap?.mustHold?.(agent.carriedParcels)) {
+                    // Parked on a delivery tile but the load doesn't qualify yet — hold and let reward decay.
+                    console.log(`[HOLD] gate=${rewardCap.gate} carried=${carriedReward.toFixed(1)} cap=${rewardCap.cap} — parked at delivery, waiting for decay`);
+                    agent.stuckCount = 0;
+                } else if (stackMin !== null && carriedCount < stackMin) {
                     // stack not full — only deliver if no parcels left to collect (deadlock prevention)
                     const uncarriedExists = [...agent.beliefs.parcels.values()].some(p => p.carriedBy === null);
                     if (uncarriedExists) {

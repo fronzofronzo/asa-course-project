@@ -77,8 +77,7 @@ const UNREACHABLE_PENALTY_TAU  = 5; // seconds — penalty halves every ~3.5s, ~
 function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map(), constraints = null, unreachableParcels = null) {
     // parcel with low belief score is probably gone — skip immediately
     if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
-    // skip parcels exceeding reward cap
-    if (constraints?.rewardCap.cap !== null && parcel.reward > constraints.rewardCap.cap) return -Infinity;
+    // reward cap is enforced at delivery (hold-and-decay), not at pickup — over-cap parcels are collectable
 
     const stepsToParcel = bfsDist(agentPos, parcel, walkable);
     if (stepsToParcel === Infinity) return -Infinity;
@@ -89,6 +88,10 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
     // gameReward: actual reward the server will give if we reach the parcel now
     const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;
     const gameReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
+
+    // deliverability: the reward decays while we walk to it AND on to a delivery tile.
+    // If it would hit 0 before we can deliver, the parcel expires in transit (wasted trip) → never pick it.
+    if (gameReward - decay * (stepsToParcel + stepsToDelivery) <= 0) return -Infinity;
 
     // effectiveReward: expected value = gameReward * P(parcel still exists)
     const effectiveReward = gameReward * (parcel.beliefScore ?? 1.0);
@@ -135,14 +138,32 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
     // PICKUP desires — skip entirely if stack.max reached
     const atStackMax = constraints?.stack?.max !== null && constraints?.stack?.max !== undefined
         && carriedCount >= constraints.stack.max;
+    const rewardCap = constraints?.rewardCap;
+    const capActive = rewardCap?.cap != null;
+    const now = Date.now();
     if (!atStackMax) {
         for (const parcel of beliefs.parcels.values()) {
             if (parcel.carriedBy !== null) continue;
             if (hardBlacklist?.has(parcel.id)) continue; // hard skip: handoff-dropped parcels
+            // reward cap: gate pickup by mode (single/stack) using the parcel's live decayed reward
+            let over = false;
+            if (capActive) {
+                const liveR = Math.max(0, parcel.reward - decay * (now - parcel.lastSeen) / 1000);
+                if (!rewardCap.allowsAdditionalPickup(carriedReward, carriedCount, liveR)) continue;
+                over = liveR > rewardCap.cap;
+            }
             const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints, unreachableParcels);
             if (utility > threshold) {
-                desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility });
+                desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility, over });
             }
+        }
+    }
+
+    // reward cap hybrid: if any sub-cap parcel is collectable, drop the over-cap ones
+    // (expensive parcels are only chased as a fallback when nothing cheap is available)
+    if (capActive && desires.some(d => d.type === 'PICKUP' && !d.over)) {
+        for (let i = desires.length - 1; i >= 0; i--) {
+            if (desires[i].type === 'PICKUP' && desires[i].over) desires.splice(i, 1);
         }
     }
 

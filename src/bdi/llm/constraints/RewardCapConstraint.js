@@ -1,56 +1,115 @@
 import { Constraint } from './Constraint.js';
 
 /**
- * Constraint: skip parcels whose reward exceeds a cap.
- * Filters parcels from getParcels() and blocks pickup at tiles with over-cap parcels.
+ * Constraint: deliver only when the carried load qualifies under the cap.
+ * Parcels are picked up freely (incl. over-cap ones); rewards decay continuously while carried,
+ * so the agent holds, parks at a delivery tile, and delivers once it qualifies.
+ * Gate ('sum' default, or 'each' via CAP_GATE_MODE): qualify when the carried TOTAL <= cap,
+ * or when EACH carried parcel <= cap (deliver as soon as every parcel is individually under).
  */
 export class RewardCapConstraint extends Constraint {
     constructor() {
         super();
         /** @type {number|null} Maximum allowed parcel reward, or null if inactive. */
         this.cap = null;
+        /** @type {'single'|'stack'} How many parcels to carry per qualifying delivery. */
+        this.mode = process.env.CAP_STACK_MODE === 'stack' ? 'stack' : 'single';
+        /** @type {'sum'|'each'} Delivery qualifies when the carried TOTAL <= cap ('sum'), or when EACH carried parcel <= cap ('each'). */
+        this.gate = process.env.CAP_GATE_MODE === 'each' ? 'each' : 'sum';
     }
 
     /**
      * @param {number} cap - maximum reward value to collect.
+     * @param {'single'|'stack'|null} [mode] - override carry mode (kept if omitted/invalid).
+     * @param {'sum'|'each'|null} [gate] - override delivery gate (kept if omitted/invalid).
      */
-    set(cap) { this.cap = cap; }
+    set(cap, mode = null, gate = null) {
+        this.cap = cap;
+        if (mode === 'single' || mode === 'stack') this.mode = mode;
+        if (gate === 'sum' || gate === 'each') this.gate = gate;
+    }
 
     /** @returns {boolean} */
     isActive() { return this.cap !== null; }
 
-    reset() { this.cap = null; }
+    reset() {
+        this.cap = null;
+        this.mode = process.env.CAP_STACK_MODE === 'stack' ? 'stack' : 'single';
+        this.gate = process.env.CAP_GATE_MODE === 'each' ? 'each' : 'sum';
+    }
 
     /** @returns {{ rewardCap: number|null }} */
     toJSON() { return { rewardCap: this.cap }; }
 
     /**
-     * Block pickup when there are over-cap parcels on the current tile.
-     * @param {object[]} carried
-     * @param {{ me: object, world: object }} ctx
+     * Pickup is unrestricted — over-cap parcels are collected and held until they decay.
      * @returns {string|null}
      */
     checkPickup(carried, ctx) {
-        if (this.cap === null) return null;
-        const { me, world } = ctx;
-        const overCap = world.parcels.filter(p =>
-            !p.carriedBy &&
-            Math.round(p.x) === Math.round(me.x) &&
-            Math.round(p.y) === Math.round(me.y) &&
-            p.reward > this.cap
-        );
-        if (overCap.length > 0) {
-            return `Mission constraint: parcel reward (${overCap[0].reward.toFixed(1)}) exceeds cap (${this.cap}). Skipping pickup.`;
-        }
         return null;
     }
 
     /**
-     * @param {{ reward:number }} parcel
-     * @returns {boolean} false if the parcel's reward exceeds the cap.
+     * Pickup filter is disabled: every parcel is allowed; the cap is enforced at delivery instead.
+     * @returns {boolean}
      */
     allowParcel(parcel) {
-        return this.cap === null || parcel.reward <= this.cap;
+        return true;
+    }
+
+    /**
+     * Whether the agent must keep holding (delivery not yet qualifying).
+     * - gate 'sum':  the carried total exceeds the cap.
+     * - gate 'each': any single carried parcel exceeds the cap.
+     * @param {object[]} carried - parcels currently carried (live decayed `reward`).
+     * @returns {boolean}
+     */
+    mustHold(carried) {
+        if (this.cap === null) return false;
+        if (this.gate === 'each') return carried.some(p => (p.reward ?? 0) > this.cap);
+        return carried.reduce((sum, p) => sum + (p.reward ?? 0), 0) > this.cap;
+    }
+
+    /**
+     * Decide whether to pick up one more parcel given the current carried load and mode.
+     * - single: one parcel per trip (max number of qualifying deliveries).
+     * - stack ('sum'):  keep adding parcels while the live total stays within the cap.
+     * - stack ('each'): keep adding any parcel that is itself within the cap.
+     * The first parcel is always allowed (incl. an expensive one — the hybrid fallback that is then held).
+     * @param {number} carriedReward - summed live (decayed) reward currently carried.
+     * @param {number} carriedCount - number of parcels currently carried.
+     * @param {number} parcelReward - candidate parcel's live (decayed) reward.
+     * @returns {boolean}
+     */
+    allowsAdditionalPickup(carriedReward, carriedCount, parcelReward) {
+        if (this.cap === null) return true;
+        if (carriedCount === 0) return true;
+        if (this.mode === 'single') return false;
+        if (this.gate === 'each') return parcelReward <= this.cap;
+        return carriedReward + parcelReward <= this.cap;
+    }
+
+    /**
+     * Block delivery until it qualifies: total <= cap ('sum') or every parcel <= cap ('each').
+     * @param {string} tileKey
+     * @param {object[]} carried
+     * @param {{ me: object, world: object }} ctx
+     * @returns {string|null}
+     */
+    checkPutdown(tileKey, carried, ctx) {
+        if (this.cap === null) return null;
+        if (this.gate === 'each') {
+            const over = carried.filter(p => (p.reward ?? 0) > this.cap);
+            if (over.length > 0) {
+                return `Mission constraint: ${over.length} carried parcel(s) exceed cap (${this.cap}). Holding for decay.`;
+            }
+            return null;
+        }
+        const total = carried.reduce((sum, p) => sum + (p.reward ?? 0), 0);
+        if (total > this.cap) {
+            return `Mission constraint: carried total (${total.toFixed(1)}) exceeds cap (${this.cap}). Holding for decay.`;
+        }
+        return null;
     }
 
     /**
