@@ -111,4 +111,27 @@ function getEffectiveDeliveryTiles(all, constraints) {
     return tiles;
 }
 
-export { bfsDist, bfsDistDirected, computeSpawnHeat, getEffectiveDeliveryTiles };
+/**
+ * Nearest walkable tile to (x,y) whose Manhattan distance is <= maxDist.
+ * Used for rendezvous: the requested point may be non-walkable, but the mission only
+ * needs an agent within maxDist of it. Returns the closest reachable approach tile, or null.
+ * Matches the arrival metric in agent.js (Manhattan distance to the target).
+ * @param {Set<string>} walkable - set of "x,y" walkable keys
+ * @param {number} x
+ * @param {number} y
+ * @param {number} maxDist
+ * @returns {{ x:number, y:number }|null}
+ */
+function nearestWalkableWithin(walkable, x, y, maxDist) {
+    const tx = Math.round(x), ty = Math.round(y);
+    if (walkable.has(`${tx},${ty}`)) return { x: tx, y: ty };
+    let best = null, bestDist = Infinity;
+    for (const key of walkable) {
+        const [wx, wy] = key.split(',').map(Number);
+        const d = Math.abs(wx - tx) + Math.abs(wy - ty);
+        if (d <= maxDist && d < bestDist) { bestDist = d; best = { x: wx, y: wy }; }
+    }
+    return best;
+}
+
+export { bfsDist, bfsDistDirected, computeSpawnHeat, getEffectiveDeliveryTiles, nearestWalkableWithin };

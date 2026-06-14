@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import OpenAI from 'openai'
 import { logLLM } from '../logger.js'
+import { nearestWalkableWithin } from '../utils.js'
 
 const baseURL = process.env.LITELLM_BASE_URL ?? 'https://llm.bears.disi.unitn.it/v1'
 const apiKey  = process.env.LITELLM_API_KEY
@@ -250,10 +251,12 @@ function setRendezvous(input, beliefs, coordinationCtx) {
         if (typeof x !== 'number' || typeof y !== 'number') return 'Error: x and y must be numbers'
         if (!coordinationCtx?.sendToPeer) return 'Error: not configured as master (sendToPeer unavailable)'
         beliefs.missionConstraints.coordination.setRendezvous(x, y, maxDist)
-        beliefs.tileUtilities.set(`${Math.round(x)},${Math.round(y)}`, 1000)
+        // The target tile may be non-walkable; navigate to the nearest walkable tile within maxDist.
+        const goto = nearestWalkableWithin(beliefs.map.walkable, x, y, maxDist) ?? { x: Math.round(x), y: Math.round(y) }
+        beliefs.tileUtilities.set(`${goto.x},${goto.y}`, 1000)
         coordinationCtx.notifyBeliefChanged?.()
         coordinationCtx.sendToPeer({ type: 'coord_cmd', mission: 'meet_and_wait', params: { x, y, maxDist } })
-        return `Rendezvous set at (${x},${y}) maxDist=${maxDist}. Command sent to peer. Navigating there now.`
+        return `Rendezvous set at (${x},${y}) maxDist=${maxDist} — navigating to nearest walkable (${goto.x},${goto.y}). Command sent to peer.`
     } catch (e) {
         return `Error: invalid JSON. Expected: {"x":N,"y":N,"maxDist":3}. Got: ${input}`
     }

@@ -2,7 +2,7 @@ import 'dotenv/config'
 import { BeliefSet } from './belief.js';
 import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
 import { nearestDeliveryTile, computeBestSpawnTile } from './planner.js';
-import { getEffectiveDeliveryTiles } from './utils.js';
+import { getEffectiveDeliveryTiles, nearestWalkableWithin } from './utils.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
 import { log, setLoggerName } from './logger.js';
@@ -205,9 +205,11 @@ function handleCoordinationMessage(senderId, msg) {
         if (mission === 'meet_and_wait') {
             const { x, y, maxDist = 3 } = params;
             coord.setRendezvous(x, y, maxDist);
-            agent.beliefs.tileUtilities.set(`${x},${y}`, 1000);
+            // The target tile may be non-walkable; navigate to the nearest walkable tile within maxDist.
+            const goto = nearestWalkableWithin(agent.beliefs.map.walkable, x, y, maxDist) ?? { x: Math.round(x), y: Math.round(y) };
+            agent.beliefs.tileUtilities.set(`${goto.x},${goto.y}`, 1000);
             agent.needsDeliberation = true;
-            console.log(`[COORD] meet_and_wait: navigating to (${x},${y}) within dist ${maxDist}`);
+            console.log(`[COORD] meet_and_wait: navigating to (${goto.x},${goto.y}) [target (${x},${y}) within dist ${maxDist}]`);
             sendToPeer({ type: 'coord_ack', mission, status: 'accepted' });
 
         } else if (mission === 'parcel_handoff') {
