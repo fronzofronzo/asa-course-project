@@ -256,7 +256,7 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
         const allowed = exitDirs.get(key); // undefined = all directions OK
         for (const { dx, dy, dir } of dirs) {
             if (allowed && !allowed.has(dir)) continue; // tile restricts this exit
-            const nx = x + dx, ny = y + dy;
+            const nx = x + dx, ny = y + dy; 
             const nkey = `${nx},${ny}`;
             if (!walkable.has(nkey) || blocked.has(nkey)) continue;
             const ng = g + 1;

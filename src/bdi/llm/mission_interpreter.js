@@ -152,7 +152,10 @@ function blacklistDeliveryTile(input, beliefs) {
 
 function setRewardCap(input, beliefs) {
     try {
-        const cap = parseFloat(input)
+        // ReAct passes Action Input verbatim — a quoted "10" arrives as the literal string '"10"'.
+        // Strip surrounding quotes/whitespace before parsing so parseFloat doesn't choke on the quotes.
+        const cleaned = String(input).trim().replace(/^["']|["']$/g, '')
+        const cap = parseFloat(cleaned)
         if (isNaN(cap) || cap <= 0) return 'Error: cap must be a positive number'
         beliefs.missionConstraints.rewardCap.set(cap)
         return `Reward cap set: skip parcels with reward > ${cap}`
@@ -294,7 +297,7 @@ function evaluateMission(input, beliefs, getGameStats, getState) {
 
         const noteMap = {
             stack:          `Stack ${n} parcels (multiplier ${params.multiplier ?? 1}x). Estimated collection time: ${(n * normalizedStats.avgCollectTime).toFixed(1)}s`,
-            preferred_tile: `Deliver at preferred tile (${params.multiplier ?? 1}x reward, ~${params.extra_steps ?? 3} extra steps vs nearest tile)`,
+            preferred_tile: `Deliver at preferred tile (${params.multiplier ?? 1}x reward${params.bonus ? ` +${params.bonus} flat bonus` : ''}, ~${params.extra_steps ?? 3} extra steps vs nearest tile)`,
             blacklist:      'Blacklisted tile yields 0 pts — always reject',
             reward_cap:     `Cap ${params.cap ?? 10}: ~${(Math.max(0, 1 - (params.cap ?? 10) / (normalizedStats.avgReward * 2)) * 100).toFixed(0)}% of parcels above cap will be skipped`,
             forbidden_tile: `Avoid tile: saves ~${((params.penalty ?? 50) * (params.prob_enter ?? 0.3)).toFixed(1)} penalty pts, costs ~${(DECAY * normalizedStats.avgReward * (params.extra_steps ?? 2)).toFixed(1)} pts in detours`,
@@ -346,6 +349,8 @@ INTERMEDIATE MISSION EVALUATION:
    Types and params:
    - {"type":"stack", "n":3, "multiplier":2.0}
    - {"type":"preferred_tile", "multiplier":5, "extra_steps":3}
+       For a FLAT reward ("deliver at (x,y) to get +1000pts"): pass {"type":"preferred_tile","bonus":1000,"multiplier":1,"extra_steps":0}.
+       The stated points are a flat one-shot "bonus", NOT a multiplier — never put 1000 in "multiplier".
    - {"type":"blacklist"}
    - {"type":"reward_cap", "cap":10}
    - {"type":"forbidden_tile", "extra_steps":2, "penalty":50, "prob_enter":0.3}
@@ -375,10 +380,16 @@ COORDINATION MISSION SETUP (TYPE 3 — master role only):
 RULE 1 — Always call get_agent_state first.
 
 RULE 2 — GOTO mission ("move to (x,y) and get +N pts"):
-  - This rule applies ONLY when the message rewards GOING to a tile.
-  - A message about what happens when you DELIVER at a tile ("deliver in (x,y) and you get 0 pts",
-    "no reward / penalty when delivering at (x,y)") is NOT a GOTO — it is a BLACKLIST mission → use RULE 4
-    with {"type":"blacklist"}. Do NOT reject it as zero-reward.
+  - This rule applies ONLY when the message rewards GOING to / MOVING to / REACHING a tile,
+    with NO mention of a parcel/package being dropped or delivered.
+  - A message about DELIVERING / DROPPING a parcel at a tile is NEVER a GOTO. Route by reward sign:
+      * reward > 0 ("deliver / drop a package at (x,y) to get +N pts") → PREFERRED-DELIVERY mission → RULE 4
+        with {"type":"preferred_tile","bonus":N,"multiplier":1,"extra_steps":0} (N = the stated flat points),
+        then set_preferred_delivery_tiles({"tiles":[{x,y}],"multiplier":1}).
+        Do NOT use GOTO/set_tile_utility — GOTO walks there empty-handed and scores nothing.
+        Do NOT put the flat points in "multiplier" — that leaves EV=0 and wrongly rejects.
+      * reward ≤ 0 ("deliver in (x,y) and you get 0 pts", "no reward / penalty when delivering at (x,y)")
+        → BLACKLIST mission → RULE 4 with {"type":"blacklist"}. Do NOT reject as zero-reward.
   - ALWAYS resolve every math expression with the calculate tool BEFORE deciding — never compute in your head.
     Step A: if the coordinates contain math (e.g. x=4*2, y=(1+3)*3), call calculate for EACH coordinate.
     Step B: if the REWARD contains math (e.g. "-2*(-5)pts", "(3-1)*4pts"), call calculate on the reward expression too.
@@ -390,11 +401,18 @@ RULE 2 — GOTO mission ("move to (x,y) and get +N pts"):
 RULE 3 — Knowledge/question mission: answer and call reply_to_sender, then Final Answer.
 
 RULE 4 — INTERMEDIATE mission (stack / preferred tile / blacklist / reward cap / forbidden tile):
-  Step 1: call evaluate_mission with the appropriate type and params.
-  Step 2a: if EV > 0 → call the relevant L2 setter tool(s), then call get_mission_state to confirm, then Final Answer "accepted".
-  Step 2b: if EV ≤ 0 → Final Answer "rejected: {reason from EV analysis}".
+  Distinguish MANDATORY DIRECTIVE from OPPORTUNITY:
+    - MANDATORY DIRECTIVE = the admin commands a behaviour with NO reward/multiplier/bonus offered
+      (e.g. "deliver exactly one package at a time", "never deliver at (x,y)", "always carry at most 2").
+      These are RULES to obey, not trades to evaluate. Do NOT call evaluate_mission and do NOT reject on EV.
+      Apply the relevant L2 setter directly, then Final Answer "accepted".
+    - OPPORTUNITY = a reward/multiplier/bonus/penalty IS stated (e.g. "stack 3 for 2x", "deliver at (x,y) for +1000",
+      "+50 penalty if you enter (x,y)"). Then:
+        Step 1: call evaluate_mission with the appropriate type and params.
+        Step 2a: if EV > 0 → call the relevant L2 setter tool(s), get_mission_state to confirm, Final Answer "accepted".
+        Step 2b: if EV ≤ 0 → Final Answer "rejected: {reason from EV analysis}".
 
-RULE 5 — Stack missions:
+RULE 5 — Stack missions (always MANDATORY directives — set directly, never EV-gate unless a reward multiplier is stated):
   "exactly N" → set_stack_requirement({"min":N,"max":N})
   "at least N" → set_stack_requirement({"min":N,"max":null})
   "at most N" → set_stack_requirement({"min":null,"max":N})

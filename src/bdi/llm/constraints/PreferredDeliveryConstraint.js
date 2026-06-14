@@ -43,17 +43,19 @@ export class PreferredDeliveryConstraint extends Constraint {
     }
 
     /**
-     * EV = (reward × multiplier) − (standard reward + decay cost of extra steps to reach preferred tile).
-     * @param {{ type:string, multiplier?:number, extra_steps?:number }} params
+     * EV = (reward × multiplier + flat bonus) − (standard reward + decay cost of extra steps to reach preferred tile).
+     * `bonus` is a one-shot flat reward awarded for delivering at the tile (e.g. "deliver at (x,y) for +1000pts").
+     * @param {{ type:string, multiplier?:number, bonus?:number, extra_steps?:number }} params
      * @param {{ avgReward:number, decay:number }} stats
      * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'preferred_tile') return null;
         const m = params.multiplier ?? 1;
+        const bonus = params.bonus ?? 0;
         const extraSteps = params.extra_steps ?? 5;
         const { avgReward, decay } = stats;
-        const guadagnoMissione = avgReward * m;
+        const guadagnoMissione = avgReward * m + bonus;
         const guadagnoStandard = avgReward + decay * avgReward * extraSteps;
         return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
     }
