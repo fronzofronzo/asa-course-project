@@ -1,7 +1,16 @@
 .env
+<<<<<<< HEAD
 node_modules/
 package-lock.json
 package.json
 *.log
 *.txt
 *.md
+=======
+CLAUDE.md
+LLM.md
+node_modules/
+package-lock.json
+package.json
+.DS_Store
+>>>>>>> 6bee3afd18a263ae1b30a925a82e0d026f67d09c
