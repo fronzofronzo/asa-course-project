@@ -130,6 +130,10 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
  * @returns {{ type: string, id: string, utility: number }[]}
  */
 function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold, unreachableParcels = null, hardBlacklist = null) {
+    // Snap to the nearest tile: mid-move the server reports fractional coords (0.6/0.4 steps),
+    // which bfsDist can't key into the walkable set → every parcel scores Infinity → empty
+    // option list → intention cleared every other tick (ping-pong). Round before pathfinding.
+    agentPos = { x: Math.round(agentPos.x), y: Math.round(agentPos.y) };
     const { deliveryTiles, walkable } = beliefs.map;
     const constraints = beliefs.missionConstraints ?? null;
     const effectiveDeliveryTiles = getEffectiveDeliveryTiles(deliveryTiles, constraints);
@@ -154,7 +158,13 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
             }
             const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints, unreachableParcels);
             if (utility > threshold) {
-                desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility, over });
+                // Rank against DELIVER on a marginal basis: while carrying, the load is delivered
+                // either way, so a pickup's ranking value = carriedReward + its own standalone value.
+                // Without this, DELIVER (≈carriedReward) always beats any pickup worth less than the
+                // whole current load → the agent never tops up with cheap parcels on its route.
+                // Threshold/deliverability still gated on the standalone `utility` above.
+                const rankU = carriedCount > 0 && utility !== -Infinity ? utility + carriedReward : utility;
+                desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility: rankU, over });
             }
         }
     }
@@ -167,16 +177,21 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
         }
     }
 
-    // DELIVER desire — only when carrying, no viable pickups visible, and stack constraint satisfied
-    if (carriedCount > 0 && desires.length === 0) {
+    // DELIVER desire — first-class option whenever carrying & stack constraint satisfied.
+    // It competes with PICKUP desires by utility + hysteresis (NOT gated on "no pickups visible").
+    // Gating it on desires.length===0 made DELIVER vanish whenever any parcel — even a cheap one —
+    // flickered into sensing range, flipping the agent between delivering and chasing → ping-pong
+    // near the delivery zone. Always emitting it lets a stable DELIVER U arbitrate against pickups.
+    if (carriedCount > 0) {
         const stackMin = constraints?.stack?.min ?? null;
         const stackReady = stackMin === null || carriedCount >= stackMin;
         if (stackReady) {
             const distDel = distToNearestDelivery(agentPos, effectiveDeliveryTiles, walkable);
-            const utility = carriedReward - decay * distDel;
+            // unreachable delivery (Infinity) → -Infinity utility → ranked last, agent keeps collecting
+            const utility = distDel === Infinity ? -Infinity : carriedReward - decay * distDel;
             desires.push({ type: 'DELIVER', id: 'DELIVER', utility });
         }
-        // if !stackReady: desires stays empty → agent explores to find more parcels
+        // if !stackReady: no DELIVER → agent keeps collecting toward stack.min
         // true deadlock (no parcels ever) is handled by the execution guard in agent.js
     }
 

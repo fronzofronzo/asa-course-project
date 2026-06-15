@@ -5,7 +5,7 @@ import { nearestDeliveryTile, computeBestSpawnTile } from './planner.js';
 import { getEffectiveDeliveryTiles, nearestWalkableWithin } from './utils.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
-import { log, setLoggerName } from './logger.js';
+import { log, setLoggerName, logOptions } from './logger.js';
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
@@ -307,6 +307,9 @@ async function agentLoop() {
         // Always compute desires so shouldDeliver has accurate parcel count
         const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD, unreachableParcels, handoffDropped);
 
+        // Log every option and its utility this iteration → logs/utility-<name>.log
+        logOptions(agentPos, desires, agent.intention?.id ?? null);
+
         // --- deliberation (periodic, on belief change, or when intention just cleared) ---
         if (agent.shouldDeliberate() || agent.intention == null) {
             const carriedBreakdown = agent.carriedParcels.map(p => `${p.id}:${p.reward.toFixed(1)}`).join(', ');
@@ -316,7 +319,25 @@ async function agentLoop() {
                 console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.id} type=${d.type} U=${d.utility.toFixed(1)})`).join(' | ')}`);
             }
 
-            const newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
+            let newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
+
+            // Persist an active PICKUP across sensing dropouts. Stepping toward a distant parcel
+            // can push it out of sensing range: its beliefScore collapses and it drops out of
+            // `desires` entirely. filterIntentions then falls back to the next-best option —
+            // even a far worse one — so the agent flip-flops between the good (out-of-range) parcel
+            // and a nearby cheap one, ping-ponging between them and reaching neither.
+            // While the target parcel is still believed, hold it unless the proposed switch BEATS
+            // its last-known utility by the hysteresis margin (compare vs remembered U, not vs the
+            // empty/absent current-tick entry).
+            if (agent.intention?.type === 'PICKUP'
+                && agent.beliefs.parcels.has(agent.intention.id)
+                && !desires.some(d => d.id === agent.intention.id)) {
+                const heldU = agent.intention.utility;
+                if (newIntention === null || newIntention.utility <= heldU + INTENTION_EPSILON) {
+                    console.log(`[INTENTION] STICKY: id=${agent.intention.id} out of range (lastU=${heldU.toFixed(2)}) — holding over ${newIntention ? `${newIntention.id} U=${newIntention.utility.toFixed(2)}` : 'none'}`);
+                    newIntention = agent.intention;
+                }
+            }
 
             if (newIntention?.id !== agent.intention?.id) {
                 agent.intention = newIntention;
@@ -571,6 +592,14 @@ async function agentLoop() {
                         }
                     }
                     console.log(`Explored spawn tile (${target.x},${target.y})`);
+                }
+                if (status === 'unreachable') {
+                    // No path at all (blocked by another agent/crate/forbidden). Don't keep
+                    // re-picking the same hot tile — mark it visited so computeBestSpawnTile
+                    // rotates to a different target next tick (else livelock against the blocker).
+                    console.warn(`[UNREACHABLE] No path to spawn (${target.x},${target.y}) — marking visited, rotating target`);
+                    visitedSpawns.set(`${target.x},${target.y}`, Date.now());
+                    agent.stuckCount = 0;
                 }
                 if (status === 'stuck') {
                     console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);

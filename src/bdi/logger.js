@@ -18,6 +18,7 @@ function ensureLogDir() {
 
 function logFile()    { return path.join(LOG_DIR, `agent-${agentId}.log`); }
 function llmLogFile() { return path.join(LOG_DIR, `llm-${agentId}.log`); }
+function utilityLogFile() { return path.join(LOG_DIR, `utility-${agentId}.log`); }
 
 function serialize(args) {
     return args.map(a => (typeof a === 'object' && a !== null ? JSON.stringify(a) : String(a))).join(' ');
@@ -34,6 +35,7 @@ function setLoggerName(name) {
     ensureLogDir();
     fs.writeFileSync(logFile(),    '', 'utf8');
     fs.writeFileSync(llmLogFile(), '', 'utf8');
+    fs.writeFileSync(utilityLogFile(), '', 'utf8');
 
     // Tee console.log → stdout + agent log file
     console.log = (...args) => {
@@ -64,4 +66,22 @@ function logLLM(message) {
     _origLog(logEntry);
 }
 
-export { log, logLLM, setLoggerName };
+/**
+ * Append one loop-iteration snapshot of all generated options and their utilities
+ * to a dedicated utility log file (utility-<agentId>.log).
+ * @param {{ x:number, y:number }} agentPos
+ * @param {{ type:string, id:string, utility:number }[]} options  desires from generateOptions, sorted desc
+ * @param {string|null} chosenId  id of the currently selected intention, if any
+ */
+function logOptions(agentPos, options, chosenId = null) {
+    const timestamp = new Date().toISOString();
+    const header = `[${timestamp}] iter @(${Math.round(agentPos.x)},${Math.round(agentPos.y)}) — ${options.length} option(s)`;
+    const lines = options.map(o => {
+        const mark = o.id === chosenId ? ' <- chosen' : '';
+        return `    ${o.type.padEnd(7)} ${String(o.id).padEnd(20)} U=${Number(o.utility).toFixed(2)}${mark}`;
+    });
+    const entry = [header, ...lines].join('\n') + '\n';
+    fs.appendFileSync(utilityLogFile(), entry, 'utf8');
+}
+
+export { log, logLLM, setLoggerName, logOptions };
