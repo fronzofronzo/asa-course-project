@@ -1,1 +1,7 @@
 .env
+CLAUDE.md
+LLM.md
+node_modules/
+package-lock.json
+package.json
+.DS_Store
