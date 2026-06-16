@@ -52,6 +52,11 @@ function setLoggerName(name) {
 
 ensureLogDir();
 
+/**
+ * Write a timestamped entry to the agent log file and stdout.
+ * Uses the original console.log to avoid double-writing after the patch in setLoggerName.
+ * @param {string} message
+ */
 function log(message) {
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] ${message}\n`;
@@ -59,6 +64,11 @@ function log(message) {
     _origLog(logEntry);  // use original — console.log may be patched and would double-write
 }
 
+/**
+ * Write a timestamped entry to the LLM log file and stdout.
+ * Separate from the main agent log to keep ReAct traces isolated.
+ * @param {string} message
+ */
 function logLLM(message) {
     const timestamp = new Date().toISOString();
     const logEntry = `[${timestamp}] ${message}\n`;
