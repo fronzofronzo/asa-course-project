@@ -11,13 +11,23 @@ import { log, setLoggerName, logOptions } from './logger.js';
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
 const UTILITY_THRESHOLD = parseFloat(process.env.UTILITY_THRESHOLD) || 0;
 const INTENTION_EPSILON = parseFloat(process.env.INTENTION_EPSILON) || 5;
-const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; // ms between re-deliberation
-const RENDEZVOUS_DWELL_MS = parseInt(process.env.RENDEZVOUS_DWELL_MS) || 3000; // hold at rendezvous before master signals resume
+const DELIBERATION_INTERVAL = parseInt(process.env.DELIBERATION_INTERVAL) || 500; 
+const RENDEZVOUS_DWELL_MS = parseInt(process.env.RENDEZVOUS_DWELL_MS) || 3000;
 
 const PEER_AGENT_NAME = process.env.PEER_AGENT_NAME ?? null;
 const AGENT_ROLE     = process.env.AGENT_ROLE ?? 'master'; // 'master' | 'slave'
 let peerAgentId = process.env.PEER_AGENT_ID ?? null; // updated live when peer messages arrive
 
+/**
+ * Agent implementing a BDI (Belief-Desire-Intention) architecture for autonomous
+ * parcel delivery in the Deliveroo.js game environment.
+ *
+ * The agent operates in a continuous loop: sense the world state (parcels, agents, map), deliberate on the best parcel to target, and execute one action per iteration
+ * (move, pick up, or put down).
+ *
+ * The agent can operate as either 'master' (orchestrates cooperative missions)
+ * or 'slave' (executes locally-relevant coordination directives from master).
+ */
 class Agent {
     constructor() {
         this.beliefs = new BeliefSet();
@@ -27,15 +37,15 @@ class Agent {
         this.x = null;
         this.y = null;
         this.socket = new DjsConnect();
-        this.intention = null;       // { parcel, utility } | null
-        this.carriedParcels = [];    // parcels currently carried
+        this.intention = null;       
+        this.carriedParcels = [];    
         this.stuckCount = 0;
-        this.gameConfig = null;      // populated by onConfig
+        this.gameConfig = null;      
         this.gameStats = {
             startTime: Date.now(),
             avgReward: 10.0,     // overwritten from config on connect
             lastScore: 0,
-            deliveries: [],      // [{reward, timestamp}] rolling last-20
+            deliveries: [],      
         };
 
         /** Flag to trigger deliberation on next loop iteration */
@@ -75,7 +85,7 @@ class Agent {
         this.score = score;
     }
 }
-
+// Creating new Agent
 const agent = new Agent();
 agent.socket.onMap((width, height, tiles) => {
     agent.beliefs.updateMap(width, height, tiles);
@@ -113,14 +123,35 @@ async function safeEmit(fn, label) {
     }
 }
 
-const visitedSpawns = new Map(); // key → timestamp of last visit
-const unreachableDeliveryTiles = new Map(); // key of delivery tiles found to be unreachable
-const unreachableParcels = new Map(); // parcelId → timestamp when marked unreachable (penalty decays over time)
+const visitedSpawns = new Map(); // key: "x,y" (spawn tile coords) → value: Date.now() of last visit                         
+const unreachableDeliveryTiles = new Map(); // key: "x,y" (delivery tile coords) → value: Date.now() when marked unreachable 
+const unreachableParcels = new Map(); // key: parcel id (string) → value: Date.now() when marked unreachable                 
 const handoffDropped = new Set(); // hard blacklist: parcels dropped by passer, not to be re-picked up until receiver gets them
+
 
 let llmBusy = false;
 const pendingMissions = [];
 
+/**
+ * Processes queued missions one at a time, in FIFO order.
+ *
+ * Missions arrive via socket messages and are pushed onto `pendingMissions`.
+ * This function drains that queue sequentially, ensuring only one LLM call
+ * runs at a time (`llmBusy` guard). If called while already processing,
+ * the loop condition exits immediately — the in-flight call will drain
+ * remaining entries when it finishes.
+ *
+ * For each mission, calls `interpretMission` with:
+ * - Current belief state and live agent position/score getters
+ * - A reply callback to respond to the mission sender
+ * - Live game stats (avg reward, delivery rate, capacity) for EV computation
+ * - A coordination context object whose shape depends on `AGENT_ROLE`:
+ *     - `master`: full context with `sendToPeer`, `getPeerAgentId`,
+ *       `findNearestOddRowTile` — enables L3 coordination tools
+ *     - `slave`: only `notifyBeliefChanged` — L3 master-only tools are no-ops
+ *
+ * `llmBusy` is always released in `finally`, even on LLM errors.
+ */
 async function drainMissions() {
     while (pendingMissions.length > 0 && !llmBusy) {
         const { name, msg, replyFn } = pendingMissions.shift();
@@ -144,7 +175,7 @@ async function drainMissions() {
                         pointsPerSecond: agent.score / Math.max(1, elapsed),
                     };
                 },
-                // master: full ctx (orchestrates L3); slave: no sendToPeer → L3 master-tools no-op, freeze stays local
+                // Master - slave coordination
                 AGENT_ROLE === 'master'
                     ? {
                         sendToPeer: (msg) => sendToPeer(msg),
@@ -165,6 +196,19 @@ const MISSION_SENDER = process.env.MISSION_SENDER ?? 'admin';
 
 // ─── Coordination helpers ─────────────────────────────────────────────────────
 
+/**
+ * Finds the walkable tile on an odd row (y % 2 !== 0) closest to the agent.
+ *
+ * Used in L3 coordination missions (master role) to pick a rendezvous tile
+ * on an odd row — a game-specific zone where the odd_row_wait mission requires
+ * both agents to meet.
+ *
+ * Scans all walkable tiles in beliefs, filters by odd y, returns the one with
+ * minimum Manhattan distance from the agent's current position.
+ *
+ * @returns {{ x: number, y: number } | null} Nearest odd-row tile, or null if
+ *   walkable map is not yet initialized.
+ */
 function findNearestOddRowTile() {
     const walkable = agent.beliefs.map.walkable;
     if (!walkable) return null;
@@ -179,6 +223,17 @@ function findNearestOddRowTile() {
     return best;
 }
 
+/**
+ * Sends a coordination message to the peer agent via the game's say channel.
+ *
+ * Serializes objects to JSON; strings are sent as-is. No-ops with a warning
+ * if `peerAgentId` is not yet known (peer hasn't been seen on the map).
+ *
+ * `peerAgentId` is resolved lazily: set from `PEER_AGENT_ID` env var at startup,
+ * or updated live when the peer's message arrives (see `socket.onMsg` handler).
+ *
+ * @param {object|string} msg - Coordination payload (e.g. `{ type: 'coord_cmd', ... }`).
+ */
 function sendToPeer(msg) {
     if (!peerAgentId) {
         console.warn('[COORD] Cannot send to peer: peerAgentId not known yet');
@@ -187,6 +242,25 @@ function sendToPeer(msg) {
     agent.socket.emitSay(peerAgentId, typeof msg === 'string' ? msg : JSON.stringify(msg));
 }
 
+/**
+ * Dispatches incoming peer coordination messages. Updates `peerAgentId` lazily on first call.
+ *
+ * `coord_cmd` (master → slave): sets coordination state + injects tile utility 1000 to override BDI:
+ *   - `meet_and_wait`        — setRendezvous, navigate to nearest walkable within maxDist
+ *   - `parcel_handoff`       — setHandoff(role), await passer's `ready` status
+ *   - `odd_row_wait`         — navigate to nearest odd-y tile, freeze until released
+ *   - `release_coordination` — reset coordination + redLight, resume normal play
+ *
+ * `coord_status` (slave → master or peer progress):
+ *   - `ready`   — passer frozen at pos → receiver navigates there
+ *   - `dropped` — passer dropped parcel → receiver clears handoff, picks up
+ *   - `arrived` — marks peerArrived on rendezvous; logged for oddRowWait
+ *
+ * `coord_ack`: logged only.
+ *
+ * @param {string} senderId - Socket ID of the peer agent.
+ * @param {string} msg      - Raw JSON coordination message.
+ */
 function handleCoordinationMessage(senderId, msg) {
     peerAgentId = senderId; // track peer ID
 
@@ -243,7 +317,6 @@ function handleCoordinationMessage(senderId, msg) {
     } else if (parsed.type === 'coord_status') {
         const { event } = parsed;
         if (event === 'ready' && coord.handoff?.role === 'receiver' && parsed.pos) {
-            // Passer frozen in place with parcels — navigate to their position
             agent.beliefs.tileUtilities.set(`${Math.round(parsed.pos.x)},${Math.round(parsed.pos.y)}`, 1000);
             agent.needsDeliberation = true;
             console.log(`[COORD] Passer waiting at (${parsed.pos.x},${parsed.pos.y}) — navigating there`);
@@ -273,7 +346,7 @@ agent.socket.onMsg(async (senderId, name, msg, ack) => {
         if (ack) try { ack('ok'); } catch {}
         return;
     }
-    // Both roles interpret admin missions; slave defers L3 coordination to master (handled in LLM prompt)
+    // Check 'admin' is the mission sender.
     if (name !== MISSION_SENDER) {
         console.log(`[MISSION] Ignored message from ${name} (not ${MISSION_SENDER})`);
         if (ack) try { ack('ignored'); } catch {}
@@ -290,11 +363,36 @@ agent.socket.onMsg(async (senderId, name, msg, ack) => {
     if (!llmBusy) await drainMissions();
 });
 
+/**
+ * Main BDI loop — runs continuously until process exit.
+ *
+ * Each iteration executes three phases in order:
+ *
+ * 1. **Deliberation** :
+ *    Calls `generateOptions` + `filterIntentions` to pick the best intention.
+ *    A held PICKUP intention survives if still valid and no better option exists.
+ *
+ * 2. **Coordination state checks** (before execution):
+ *    - Rendezvous: freeze (redLight) when within `maxDist` of target; master releases both after dwell.
+ *    - Odd-row wait: freeze when on any odd-y tile; signal peer.
+ *    - Passer handoff: freeze in place, signal position to receiver, drop once receiver is visible.
+ *
+ * 3. **Execution** (one action per iteration, exclusive branches):
+ *    - `DELIVER`  — navigate to nearest effective delivery tile; `put_down` on arrival.
+ *                   Respects `rewardCap` (hold until decay) and `stackMin` (wait for more parcels).
+ *    - `PICKUP`   — navigate to parcel tile; `pick_up` on arrival.
+ *                   Respects `stackMax` (drop excess immediately after pickup).
+ *    - `GOTO`     — navigate to a coordination-injected tile (tileUtilities); clear on arrival.
+ *    - Exploration — `computeBestSpawnTile` heatmap; marks visited spawns + neighbors within dist 2.
+ *
+ * Stuck detection: 5 consecutive failed moves → mark target unreachable, clear intention.
+ * Movement freeze: skips execution when `missionConstraints.isMovementFrozen()
+ */
 async function agentLoop() {
     console.log('Agent loop started — executing continuously with periodic deliberation...');
 
     while (true) {
-        // Wait for agent position to be set (first onYou callback)
+        // Wait for agent position to be set
         if (agent.x === null) {
             await new Promise(resolve => setTimeout(resolve, 100));
             continue;
@@ -304,37 +402,23 @@ async function agentLoop() {
         const carriedCount = agent.carriedParcels.length;
         const carriedReward = agent.carriedParcels.reduce((sum, p) => sum + p.reward, 0);
 
-        // Always compute desires so shouldDeliver has accurate parcel count
         const desires = generateOptions(agent.beliefs, agentPos, carriedCount, carriedReward, DECAY, UTILITY_THRESHOLD, unreachableParcels, handoffDropped);
 
-        // Log every option and its utility this iteration → logs/utility-<name>.log
+        // Log every option and its utility this iteration.
         logOptions(agentPos, desires, agent.intention?.id ?? null);
 
-        // --- deliberation (periodic, on belief change, or when intention just cleared) ---
+        // --- deliberation ---
         if (agent.shouldDeliberate() || agent.intention == null) {
             const carriedBreakdown = agent.carriedParcels.map(p => `${p.id}:${p.reward.toFixed(1)}`).join(', ');
-            console.log(`\n[DELIBERATION] at (${Math.round(agent.x)},${Math.round(agent.y)}) | carried=${carriedCount} reward=${carriedReward.toFixed(1)}${carriedCount > 0 ? ` [${carriedBreakdown}]` : ''}`);
-            console.log(`[DELIBERATION] Found ${desires.length} viable parcel(s)`);
-            if (desires.length > 0) {
-                console.log(`[DELIBERATION] Top 3: ${desires.slice(0, 3).map(d => `(${d.id} type=${d.type} U=${d.utility.toFixed(1)})`).join(' | ')}`);
-            }
-
+            
             let newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
 
-            // Persist an active PICKUP across sensing dropouts. Stepping toward a distant parcel
-            // can push it out of sensing range: its beliefScore collapses and it drops out of
-            // `desires` entirely. filterIntentions then falls back to the next-best option —
-            // even a far worse one — so the agent flip-flops between the good (out-of-range) parcel
-            // and a nearby cheap one, ping-ponging between them and reaching neither.
-            // While the target parcel is still believed, hold it unless the proposed switch BEATS
-            // its last-known utility by the hysteresis margin (compare vs remembered U, not vs the
-            // empty/absent current-tick entry).
+            // Stick with Pickup intention if it's still valid and has higher utility than any new desire.
             if (agent.intention?.type === 'PICKUP'
                 && agent.beliefs.parcels.has(agent.intention.id)
                 && !desires.some(d => d.id === agent.intention.id)) {
                 const heldU = agent.intention.utility;
                 if (newIntention === null || newIntention.utility <= heldU + INTENTION_EPSILON) {
-                    console.log(`[INTENTION] STICKY: id=${agent.intention.id} out of range (lastU=${heldU.toFixed(2)}) — holding over ${newIntention ? `${newIntention.id} U=${newIntention.utility.toFixed(2)}` : 'none'}`);
                     newIntention = agent.intention;
                 }
             }
@@ -366,19 +450,15 @@ async function agentLoop() {
                     r.selfArrived = true;
                     agent.beliefs.missionConstraints.redLight.set(true);
                     sendToPeer({ type: 'coord_status', mission: 'meet_and_wait', event: 'arrived' });
-                    console.log(`[COORD] Arrived at rendezvous (${agent.x},${agent.y}) dist=${dist} — freezing`);
                 }
             }
 
-            // Master auto-releases the rendezvous once BOTH agents have arrived.
-            // Dwell briefly so the server registers the mutual wait (500pt bonus), then signal resume to the slave.
+            // Master rendez-vous handling.
             if (AGENT_ROLE === 'master' && coord.rendezvous && coord.rendezvous.selfArrived && coord.rendezvous.peerArrived) {
                 const r = coord.rendezvous;
                 if (!r.bothArrivedAt) {
                     r.bothArrivedAt = Date.now();
-                    console.log('[COORD] Both agents at rendezvous — holding before resume');
                 } else if (Date.now() - r.bothArrivedAt >= RENDEZVOUS_DWELL_MS) {
-                    console.log('[COORD] Rendezvous complete — master signalling resume to peer, both resuming');
                     sendToPeer({ type: 'coord_cmd', mission: 'release_coordination' });
                     agent.beliefs.missionConstraints.redLight.set(false);
                     agent.beliefs.missionConstraints.coordination.reset();
@@ -391,7 +471,6 @@ async function agentLoop() {
                 coord.oddRowArrived = true;
                 agent.beliefs.missionConstraints.redLight.set(true);
                 sendToPeer({ type: 'coord_status', mission: 'odd_row_wait', event: 'arrived' });
-                console.log(`[COORD] Arrived at odd row y=${agent.y} — freezing`);
             }
 
             // Passer: once carrying a parcel, freeze in place and wait for receiver
@@ -399,7 +478,6 @@ async function agentLoop() {
                 if (!coord.handoff.positionSent) {
                     coord.handoff.positionSent = true;
                     sendToPeer({ type: 'coord_status', mission: 'parcel_handoff', event: 'ready', pos: { x: agent.x, y: agent.y } });
-                    console.log(`[COORD] Passer frozen at (${agent.x},${agent.y}) with ${carriedCount} parcel(s) — waiting for receiver`);
                 }
                 const receiverVisible = [...agent.beliefs.agents.values()].some(a => a.id === peerAgentId || a.name === PEER_AGENT_NAME);
                 if (receiverVisible) {
@@ -412,10 +490,9 @@ async function agentLoop() {
                     sendToPeer({ type: 'coord_status', mission: 'parcel_handoff', event: 'dropped', tile: { x: agent.x, y: agent.y } });
                     coord.clearHandoff();
                     agent._notifyBeliefChanged();
-                    console.log(`[COORD] Receiver in range — dropped ${toDrop.length} parcel(s) at (${agent.x},${agent.y})`);
                 } else {
                     await new Promise(r => setTimeout(r, 50));
-                    continue; // freeze: skip execution branches this iteration
+                    continue; 
                 }
             }
         }
@@ -428,46 +505,29 @@ async function agentLoop() {
 
         // --- execution (continuous, one step per iteration) ---
         if (agent.intention?.type === 'DELIVER') {
-            console.log(`[EXECUTE] DELIVERY PHASE (carried=${carriedCount}, reward=${carriedReward.toFixed(1)})`);
-            // Use blacklist/preferred-filtered tiles: never count a blacklisted tile as a valid drop spot
             const effectiveDelivery = getEffectiveDeliveryTiles(agent.beliefs.map.deliveryTiles, agent.beliefs.missionConstraints ?? null);
             const onDelivery = effectiveDelivery
                 .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
 
+            // Agent is in some delivery tile.
             if (onDelivery) {
                 const rewardCap = agent.beliefs.missionConstraints?.rewardCap;
                 const stackMin = agent.beliefs.missionConstraints?.stack?.min ?? null;
                 if (rewardCap?.mustHold?.(agent.carriedParcels)) {
-                    // Parked on a delivery tile but the load doesn't qualify yet — hold and let reward decay.
-                    console.log(`[HOLD] gate=${rewardCap.gate} carried=${carriedReward.toFixed(1)} cap=${rewardCap.cap} — parked at delivery, waiting for decay`);
                     agent.stuckCount = 0;
                 } else if (stackMin !== null && carriedCount < stackMin) {
-                    // stack not full — only deliver if no parcels left to collect (deadlock prevention)
                     const uncarriedExists = [...agent.beliefs.parcels.values()].some(p => p.carriedBy === null);
-                    if (uncarriedExists) {
-                        console.log(`[STACK] Carrying ${carriedCount}/${stackMin} min — aborting delivery, parcels still exist`);
-                        agent.intention = null; // re-deliberate: find more parcels
-                    } else {
-                        await safeEmit(() => agent.socket.emitPutdown(), 'PUTDOWN');
-                        console.log(`[STACK] Carrying ${carriedCount}/${stackMin} min — delivering anyway (no more parcels to collect)`);
-                        agent.stuckCount = 0;
-                        agent.intention = null;
-                    }
+                    agent.intention = null;
                 } else {
                     const dropped = await safeEmit(() => agent.socket.emitPutdown(), 'PUTDOWN');
-                    console.log(`[EXECUTE] ✓ Delivered ${dropped?.length ?? 0} parcel(s) at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     agent.stuckCount = 0;
                     agent.intention = null;
                 }
             } else {
                 const target = nearestDeliveryTile(agent, unreachableDeliveryTiles);
                 if (target) {
-                    console.log(`[EXECUTE] Moving to delivery (${target.x},${target.y})`);
                     const status = await stepToward(target, agent);
-                    console.log(`[EXECUTE] Move result: ${status} now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     if (status === 'unreachable') {
-                        // No path at all (e.g. forbidden/blocked destination): abandon this tile now, re-pick another
-                        console.warn(`[UNREACHABLE] No path to delivery (${target.x},${target.y}) - marking unreachable, re-deliberating`);
                         unreachableDeliveryTiles.set(`${target.x},${target.y}`, Date.now());
                         agent.stuckCount = 0;
                         agent.needsDeliberation = true;
@@ -475,15 +535,12 @@ async function agentLoop() {
                         agent.stuckCount++;
                     }
                     if (agent.stuckCount > 5) {
-                        console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach delivery at (${target.x},${target.y}) - marking as unreachable`);
                         unreachableDeliveryTiles.set(`${target.x},${target.y}`, Date.now());
                         agent.stuckCount = 0;
                     }
-                } else {
-                    console.warn('[EXECUTE] ✗ No reachable delivery tile');
                 }
             }
-
+        // Pickup intention handling.
         } else if (agent.intention?.type === 'PICKUP') {
             const p = agent.intention.parcel;
             const onParcel = () => Number.isInteger(agent.x) && Number.isInteger(agent.y)
@@ -491,22 +548,16 @@ async function agentLoop() {
 
             // Move toward the parcel if not already standing on it
             if (!onParcel()) {
-                console.log(`[EXECUTE] Moving to parcel ${p.id} at (${p.x},${p.y}) (${Math.round(Math.sqrt((p.x - agent.x) ** 2 + (p.y - agent.y) ** 2))} steps away)`);
                 const status = await stepToward(p, agent);
-                console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'unreachable') {
-                    // No path exists right now — mark immediately, penalty will decay over time
                     unreachableParcels.set(p.id, Date.now());
-                    console.warn(`[STUCK] Parcel ${p.id} unreachable — penalizing, will retry as penalty decays`);
                     agent.intention = null;
                     agent.stuckCount = 0;
                 } else if (status === 'stuck') {
                     agent.stuckCount++;
-                    console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach parcel ${p.id} at (${p.x},${p.y})`);
                     if (agent.stuckCount > 5) {
                         // Repeated move failures — also penalize
                         unreachableParcels.set(p.id, Date.now());
-                        console.warn(`[STUCK] Parcel ${p.id} blocked after ${agent.stuckCount} failed moves — penalizing`);
                         agent.intention = null;
                         agent.stuckCount = 0;
                     }
@@ -515,27 +566,21 @@ async function agentLoop() {
                 }
             }
 
-            // Pickup if on the parcel — either already there at start, or just landed this step
+            // Pickup if on the parcel 
             if (onParcel() && agent.intention?.type === 'PICKUP') {
-                console.log(`[EXECUTE] PICKUP at (${p.x},${p.y})`);
                 const pickedUp = await safeEmit(() => agent.socket.emitPickup(), 'PICKUP');
                 if (pickedUp?.length > 0) {
                     const stackMax = agent.beliefs.missionConstraints?.stack?.max ?? null;
                     const newTotal = carriedCount + pickedUp.length;
                     if (stackMax !== null && newTotal > stackMax) {
-                        // emitPickup grabbed more than stack.max allows — drop excess immediately
+                        // Drop parcels if exceeds stack max.
                         const excess = newTotal - stackMax;
                         const toDrop = pickedUp.slice(pickedUp.length - excess).map(q => q.id);
                         await safeEmit(() => agent.socket.emitPutdown(toDrop), 'PUTDOWN');
-                        console.log(`[STACK] Picked up ${pickedUp.length}, dropped ${toDrop.length} excess to stay at max=${stackMax}`);
-                    } else {
-                        console.log(`[EXECUTE] ✓ Picked up ${pickedUp.length} parcel(s)`);
                     }
                     agent.intention = null;
                     agent.stuckCount = 0;
                 } else {
-                    // On the tile but nothing picked up: parcel is gone — penalize so we don't re-target the phantom
-                    console.warn(`[EXECUTE] ✗ Pickup failed at (${p.x},${p.y}) - parcel gone, penalizing`);
                     unreachableParcels.set(p.id, Date.now());
                     agent.intention = null;
                 }
@@ -547,25 +592,19 @@ async function agentLoop() {
             const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
             const onTile = isStable && agent.x === gotoTile.x && agent.y === gotoTile.y;
 
-            console.log(`[EXECUTE] GOTO (${gotoTile.x},${gotoTile.y})`);
             if (onTile) {
-                console.log(`[EXECUTE] ✓ Arrived at GOTO tile (${gotoTile.x},${gotoTile.y}), clearing`);
                 agent.beliefs.tileUtilities.delete(gotoKey);
                 agent.intention = null;
                 agent.stuckCount = 0;
             } else {
                 const status = await stepToward(gotoTile, agent);
-                console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'unreachable') {
-                    console.warn(`[UNREACHABLE] No path to GOTO tile (${gotoTile.x},${gotoTile.y}) - abandoning`);
                     agent.beliefs.tileUtilities.delete(gotoKey);
                     agent.intention = null;
                     agent.stuckCount = 0;
                 } else if (status === 'stuck') {
                     agent.stuckCount++;
-                    console.warn(`[STUCK] Count=${agent.stuckCount} trying to reach GOTO tile (${gotoTile.x},${gotoTile.y})`);
                     if (agent.stuckCount > 5) {
-                        console.warn(`[STUCK] Abandoning GOTO tile (${gotoTile.x},${gotoTile.y}) as unreachable`);
                         agent.beliefs.tileUtilities.delete(gotoKey);
                         agent.intention = null;
                         agent.stuckCount = 0;
@@ -576,13 +615,11 @@ async function agentLoop() {
             }
 
         } else {
-            console.log(`[EXECUTE] EXPLORATION PHASE`);
+            // ---- Exploration phase, no intention present ---- 
             const target = computeBestSpawnTile(agent, visitedSpawns);
             if (target) {
                 const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
-                console.log(`[EXECUTE] Moving to spawn at (${target.x},${target.y}) (${dist} steps away)`);
                 const status = await stepToward(target, agent);
-                console.log(`[EXECUTE] Move result: ${status} | now at (${Math.round(agent.x)},${Math.round(agent.y)})`);
                 if (status === 'arrived') {
                     const now = Date.now();
                     visitedSpawns.set(`${target.x},${target.y}`, now);
@@ -591,36 +628,26 @@ async function agentLoop() {
                             visitedSpawns.set(`${t.x},${t.y}`, now);
                         }
                     }
-                    console.log(`Explored spawn tile (${target.x},${target.y})`);
                 }
                 if (status === 'unreachable') {
-                    // No path at all (blocked by another agent/crate/forbidden). Don't keep
-                    // re-picking the same hot tile — mark it visited so computeBestSpawnTile
-                    // rotates to a different target next tick (else livelock against the blocker).
-                    console.warn(`[UNREACHABLE] No path to spawn (${target.x},${target.y}) — marking visited, rotating target`);
                     visitedSpawns.set(`${target.x},${target.y}`, Date.now());
                     agent.stuckCount = 0;
                 }
                 if (status === 'stuck') {
-                    console.warn(`[STUCK] Cannot reach spawn at (${target.x},${target.y})`);
                     agent.stuckCount++;
                     if (agent.stuckCount > 5) {
-                        console.warn(`[STUCK] stuckCount=${agent.stuckCount} > 5, marking spawn (${target.x},${target.y}) as visited`);
                         visitedSpawns.set(`${target.x},${target.y}`, Date.now());
                         agent.stuckCount = 0;
                     }
                 }
-            } else {
-                console.warn('[EXECUTE] No spawn target found');
             }
         }
-
-        // Small delay to prevent busy-waiting
-        await new Promise(resolve => setTimeout(resolve, 50));
     }
 }
 
 agentLoop();
+
+// Logging functions.
 
 setInterval(() => {
     agent.beliefs.log();
