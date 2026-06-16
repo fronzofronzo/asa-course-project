@@ -59,7 +59,7 @@ export class Constraint {
      * Compute expected value for a mission of the given type.
      * @param {{ type: string, [key: string]: any }} params - mission parameters.
      * @param {{ avgReward:number, avgCollectTime:number, decay:number, pps:number }} stats - rolling game stats.
-     * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null} null if type not handled.
+     * @returns {{ ev:number, missionGain:number, standardGain:number }|null} null if type not handled.
      */
     computeEV(params, stats) { return null; }
 }

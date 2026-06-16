@@ -101,7 +101,7 @@ export class MissionConstraints {
      * Compute expected value for a mission. Dispatches to the first constraint that handles the type.
      * @param {{ type:string, [key:string]: any }} params
      * @param {{ avgReward:number, avgCollectTime:number, decay:number, pps:number }} stats
-     * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null} null if type unknown.
+     * @returns {{ ev:number, missionGain:number, standardGain:number }|null} null if type unknown.
      */
     computeEV(params, stats) {
         for (const c of this._all) {

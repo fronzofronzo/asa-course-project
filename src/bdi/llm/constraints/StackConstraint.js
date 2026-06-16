@@ -81,7 +81,7 @@ export class StackConstraint extends Constraint {
      * With m < 1 the mission always loses (penalty) → EV < 0 → reject. With m ≥ ~1 it can win.
      * @param {{ type:string, n?:number, min?:number, multiplier?:number }} params
      * @param {{ avgReward:number, avgCollectTime:number, decay:number }} stats
-     * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
+     * @returns {{ ev:number, missionGain:number, standardGain:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'stack') return null;
@@ -91,8 +91,8 @@ export class StackConstraint extends Constraint {
         // Stacking holds parcels ~n/2 collect-cycles on average; standard delivery ~0.5.
         const decayStack = Math.min(0.99, decay * (n / 2) * avgCollectTime);
         const decayStd   = Math.min(0.99, decay * 0.5 * avgCollectTime);
-        const guadagnoMissione = n * avgReward * m * (1 - decayStack);
-        const guadagnoStandard = n * avgReward * 1 * (1 - decayStd);
-        return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
+        const missionGain = n * avgReward * m * (1 - decayStack);
+        const standardGain = n * avgReward * 1 * (1 - decayStd);
+        return { ev: missionGain - standardGain, missionGain, standardGain };
     }
 }

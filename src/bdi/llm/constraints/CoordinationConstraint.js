@@ -33,8 +33,10 @@ export class CoordinationConstraint extends Constraint {
         this.handoff = { role, state: 'pending', positionSent: false };
     }
 
+    /** Clear the active handoff sub-state. */
     clearHandoff() { this.handoff = null; }
 
+    /** Begin an odd-row-wait: freeze on the nearest odd-y tile until released. */
     setOddRowWait() { this.oddRowWait = true; this.oddRowArrived = false; }
 
     /** @returns {boolean} */
@@ -74,7 +76,7 @@ export class CoordinationConstraint extends Constraint {
      *
      * @param {{ type:string, [key:string]: any }} params
      * @param {{ pps:number, movDurationSec:number, position:{x:number,y:number} }} stats
-     * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
+     * @returns {{ ev:number, missionGain:number, standardGain:number }|null}
      */
     computeEV(params, stats) {
         const pps          = stats.pps          ?? 1;
@@ -86,14 +88,14 @@ export class CoordinationConstraint extends Constraint {
             const stepsToTarget = Math.abs(mx - (params.x ?? mx)) + Math.abs(my - (params.y ?? my));
             const waitSec      = params.wait_seconds ?? 10;
             const oppCost      = (stepsToTarget * movDurSec + waitSec) * pps;
-            return { ev: bonus - oppCost, guadagnoMissione: bonus, guadagnoStandard: oppCost };
+            return { ev: bonus - oppCost, missionGain: bonus, standardGain: oppCost };
         }
 
         if (params.type === 'parcel_handoff') {
             const bonus    = params.bonus ?? 200;
             const extra    = params.extra_steps ?? 8;
             const oppCost  = extra * movDurSec * pps;
-            return { ev: bonus - oppCost, guadagnoMissione: bonus, guadagnoStandard: oppCost };
+            return { ev: bonus - oppCost, missionGain: bonus, standardGain: oppCost };
         }
 
         if (params.type === 'odd_row_wait') {
@@ -101,7 +103,7 @@ export class CoordinationConstraint extends Constraint {
             const stepsOdd   = params.steps_to_odd_row ?? 3;
             const waitSec    = params.wait_seconds ?? 30;
             const oppCost    = (stepsOdd * movDurSec + waitSec) * pps;
-            return { ev: bonus - oppCost, guadagnoMissione: bonus, guadagnoStandard: oppCost };
+            return { ev: bonus - oppCost, missionGain: bonus, standardGain: oppCost };
         }
 
         return null;
