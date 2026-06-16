@@ -11,8 +11,9 @@ export const ExplorePlan = {
             if (status === 'arrived') {
                 const now = Date.now();
                 ctx.visitedSpawns.set(`${target.x},${target.y}`, now);
+                const sensingRange = agent.gameConfig?.player?.observation_distance ?? 3;
                 for (const t of agent.beliefs.map.spawnTiles) {
-                    if (Math.abs(t.x - target.x) + Math.abs(t.y - target.y) <= 2) {
+                    if (Math.abs(t.x - target.x) + Math.abs(t.y - target.y) < sensingRange) {
                         ctx.visitedSpawns.set(`${t.x},${t.y}`, now);
                     }
                 }
