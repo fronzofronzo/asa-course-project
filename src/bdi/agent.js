@@ -504,6 +504,7 @@ async function agentLoop() {
         const plan = plans.find(p => p.applicable(agent.intention));
         if (plan) await plan.execute(agent, ctx);
 
+        // Loop delay to avoid too fast movements in local.
         await new Promise(resolve => setTimeout(resolve, 50));
     }
 }
