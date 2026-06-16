@@ -9,22 +9,23 @@ class BeliefSet {
         this.map = {
             width: null,
             height: null,
-            tiles: new Map(),      // key: `${x},${y}` → { x, y, type }
-            deliveryTiles: [],     // IOTile[] where type === '2'
-            spawnTiles: [],        // IOTile[] where type === '1'
-            walkable: new Set(),   // Set of `${x},${y}` strings
-            exitDirs: new Map(),   // key: `${x},${y}` → Set of allowed exit directions ('up'|'down'|'left'|'right'); absent = all directions allowed
-            spawnHeat: new Map(),  // key: `${x},${y}` → heat value (0-1)
-            pushTargets: new Set(),// `${x},${y}` of crate-pushable (yellow) cells: tile type '5' / '5!'
+            tiles: new Map(),
+            deliveryTiles: [],
+            spawnTiles: [],
+            walkable: new Set(),
+            exitDirs: new Map(),
+            spawnHeat: new Map(),
+            pushTargets: new Set(),
         };
-        this.parcels = new Map();  // id → { id, x, y, reward, carriedBy, lastSeen, beliefScore, inRange }
-        this.agents  = new Map();  // id → { id, name, x, y, score, lastSeen }
-        this.crates  = new Map();  // id → { id, x, y } — pushable obstacles (Sokoban-style)
-        this.tileUtilities = new Map(); // "x,y" → number (LLM-injected tile goals)
+        this.parcels = new Map();
+        this.agents  = new Map();
+        this.crates  = new Map();
+        this.tileUtilities = new Map();
         this.missionConstraints = new MissionConstraints();
     }
 
     /**
+     * Update the belief set with the latest parcel information.
      * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOParcel').IOParcel[]} parcels
      */
     updateParcels(parcels) {
@@ -58,6 +59,7 @@ class BeliefSet {
     }
 
     /**
+     * Update the belief set with the latest agent information.
      * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOAgent').IOAgent[]} agents
      */
     updateAgents(agents) {
@@ -85,19 +87,17 @@ class BeliefSet {
     }
 
     /**
+     * Update the belief set with the latest crate information.
      * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOCrate').IOCrate[]} crates
      */
     updateCrates(crates) {
-        // Crates are static obstacles: upsert by id (refreshes position, incl. our own
-        // pushes — same id, new cell) and PERSIST when out of sensing range. Pruning on
-        // unseen made crateCells flicker as the agent moved, flipping the A* blocked set
-        // and causing navigation livelock. Cleared on new map (updateMap).
         for (const c of crates) {
             this.crates.set(c.id, { id: c.id, x: Math.round(c.x), y: Math.round(c.y) });
         }
     }
 
-    /** @returns {Set<string>} "x,y" keys currently occupied by a crate */
+    /** 
+     * @returns {Set<string>} "x,y" keys currently occupied by a crate */
     crateCells() {
         const s = new Set();
         for (const c of this.crates.values()) s.add(`${c.x},${c.y}`);
@@ -111,9 +111,9 @@ class BeliefSet {
       this.updateCrates(crates ?? []);
       const after = new Set(this.parcels.keys());                                                                                                                                                                       
    
-      const newParcels = [...after]                                                                                                                                                                                     
-          .filter(id => !before.has(id))
-          .map(id => this.parcels.get(id));
+      const newParcels = [...after]
+        .filter(id => !before.has(id))
+        .map(id => this.parcels.get(id));
       const lostParcelIds = [...before].filter(id => !after.has(id));                                                                                                                                                   
       return { newParcels, lostParcelIds };
     }   
@@ -154,24 +154,8 @@ class BeliefSet {
         }
     }
 
-    log() {
-        console.log('--- BeliefSet ---');
-        console.log(`Map: ${this.map.width}x${this.map.height} | walkable: ${this.map.walkable.size} | delivery: ${this.map.deliveryTiles.length} | spawn: ${this.map.spawnTiles.length}`);
-        console.log(`Parcels (${this.parcels.size}):`);
-        for (const p of this.parcels.values()) {
-            const age = Math.round((Date.now() - p.lastSeen) / 1000);
-            const bs  = p.beliefScore?.toFixed(3) ?? '1.000';
-            console.log(`  [${p.id}] (${p.x},${p.y}) reward=${p.reward} carriedBy=${p.carriedBy ?? 'none'} age=${age}s belief=${bs} inRange=${p.inRange}`);
-        }
-        console.log(`Agents (${this.agents.size}):`);
-        for (const a of this.agents.values()) {
-            const age = Math.round((Date.now() - a.lastSeen) / 1000);
-            console.log(`  [${a.id}] ${a.name} (${a.x},${a.y}) score=${a.score} age=${age}s`);
-        }
-        console.log('-----------------');
-    }
-
     /**
+     * Update the belief set with the latest map information.
  * @param {number} width
  * @param {number} height
  * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOTile').IOTile[]} tiles
@@ -213,15 +197,6 @@ updateMap(width, height, tiles) {
     this._logHeatMap();
 }
 
-_logHeatMap() {
-        const lines = [];
-        for (const [key, heat] of this.map.spawnHeat) {
-            lines.push(`Cell {${key}} -> ${heat.toFixed(4)}`);
-        }
-        const output = lines.join('\n');
-        console.log(output);
-        writeFileSync('heatmap.txt', output + '\n', 'utf8');
-    }
 }
 
 BeliefSet.PARCEL_TTL_MS = 5000;
