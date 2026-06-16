@@ -436,7 +436,7 @@ function evaluateMission(input, beliefs, getGameStats, getState) {
             return `Error: unknown mission type "${params.type}". Valid: stack | preferred_tile | blacklist | reward_cap | forbidden_tile | red_light | meet_and_wait | parcel_handoff | odd_row_wait`
         }
 
-        const { ev, guadagnoMissione: missionGain, guadagnoStandard: standardGain } = result
+        const { ev, missionGain, standardGain } = result
         const n = params.n ?? params.min ?? 3
 
         const noteMap = {

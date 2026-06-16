@@ -105,7 +105,7 @@ export class MyConstraint extends Constraint {
     computeEV(params, stats) {
         if (params.type !== 'my_type') return null;
         // ... math here ...
-        return { ev, guadagnoMissione, guadagnoStandard };
+        return { ev, missionGain, standardGain };
     }
 }
 ```
@@ -164,9 +164,9 @@ export class MyConstraint extends Constraint {
 
     computeEV(params, stats) {
         if (params.type !== 'my_type') return null;
-        const guadagnoMissione = /* ... */;
-        const guadagnoStandard = /* ... */;
-        return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
+        const missionGain = /* ... */;
+        const standardGain = /* ... */;
+        return { ev: missionGain - standardGain, missionGain, standardGain };
     }
 }
 ```

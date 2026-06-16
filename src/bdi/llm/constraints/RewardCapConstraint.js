@@ -119,16 +119,16 @@ export class RewardCapConstraint extends Constraint {
      * So EV = adaptive gain − (adaptive gain discounted by that wasted fraction) ≥ 0.
      * @param {{ type:string, cap?:number }} params
      * @param {{ avgReward:number }} stats
-     * @returns {{ ev:number, guadagnoMissione:number, guadagnoStandard:number }|null}
+     * @returns {{ ev:number, missionGain:number, standardGain:number }|null}
      */
     computeEV(params, stats) {
         if (params.type !== 'reward_cap') return null;
         const cap = params.cap ?? 10;
         const { avgReward } = stats;
         const fracAboveCap = Math.max(0, 1 - cap / (avgReward * 2));
-        const guadagnoMissione = avgReward * (1 - fracAboveCap);
+        const missionGain = avgReward * (1 - fracAboveCap);
         // Ignoring the rule wastes the over-cap fraction of effort (those deliveries pay 0).
-        const guadagnoStandard = guadagnoMissione * (1 - fracAboveCap);
-        return { ev: guadagnoMissione - guadagnoStandard, guadagnoMissione, guadagnoStandard };
+        const standardGain = missionGain * (1 - fracAboveCap);
+        return { ev: missionGain - standardGain, missionGain, standardGain };
     }
 }

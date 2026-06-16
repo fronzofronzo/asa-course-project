@@ -49,11 +49,11 @@ export class RedLightConstraint extends Constraint {
      * Always positive — the bonus outweighs any opportunity cost of pausing.
      * @param {{ type: string, bonus?: number }} params
      * @param {object} _stats
-     * @returns {{ ev: number, guadagnoMissione: number, guadagnoStandard: number }|null}
+     * @returns {{ ev: number, missionGain: number, standardGain: number }|null}
      */
     computeEV(params, _stats) {
         if (params.type !== 'red_light') return null;
         const bonus = params.bonus ?? 10000;
-        return { ev: bonus, guadagnoMissione: bonus, guadagnoStandard: 0 };
+        return { ev: bonus, missionGain: bonus, standardGain: 0 };
     }
 }
