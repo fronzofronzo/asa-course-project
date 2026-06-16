@@ -1,5 +1,11 @@
 import { stepToward } from '../deliberation.js';
 
+const GOTO_RETRY_MS = 7000;
+
+function scheduleReinjection(beliefs, key, utility) {
+    setTimeout(() => beliefs.tileUtilities.set(key, utility), GOTO_RETRY_MS);
+}
+
 export const GotoPlan = {
     applicable: (intention) => intention?.type === 'GOTO',
 
@@ -16,15 +22,19 @@ export const GotoPlan = {
         } else {
             const status = await stepToward(gotoTile, agent);
             if (status === 'unreachable') {
+                const savedUtility = agent.beliefs.tileUtilities.get(gotoKey);
                 agent.beliefs.tileUtilities.delete(gotoKey);
                 agent.intention = null;
                 agent.stuckCount = 0;
+                scheduleReinjection(agent.beliefs, gotoKey, savedUtility);
             } else if (status === 'stuck') {
                 agent.stuckCount++;
                 if (agent.stuckCount > 5) {
+                    const savedUtility = agent.beliefs.tileUtilities.get(gotoKey);
                     agent.beliefs.tileUtilities.delete(gotoKey);
                     agent.intention = null;
                     agent.stuckCount = 0;
+                    scheduleReinjection(agent.beliefs, gotoKey, savedUtility);
                 }
             } else {
                 agent.stuckCount = 0;
