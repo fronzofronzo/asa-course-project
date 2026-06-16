@@ -14,7 +14,6 @@ function getDomain() {
 
 const cellName = (x, y) => `c_${x}_${y}`;
 
-// Project convention: right=x+1, left=x-1, up=y+1, down=y-1
 const DIRS = [
     { dir: 'Up',    dx: 0,  dy: 1  },
     { dir: 'Down',  dx: 0,  dy: -1 },

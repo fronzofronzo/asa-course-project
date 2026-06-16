@@ -17,11 +17,22 @@ if (!apiKey) {
 
 // ─── ReAct helpers ───────────────────────────────────────────────────────────
 
+/**
+ * Send the conversation history to the LLM and return the assistant's text reply.
+ * @param {Array<{role: string, content: string}>} messages - Full ReAct conversation so far.
+ * @param {{temperature?: number}} [options] - Sampling options; temperature defaults to 0 for determinism.
+ * @returns {Promise<string>} The assistant message content, or '' if none was returned.
+ */
 async function callModel(messages, { temperature = 0 } = {}) {
     const response = await client.chat.completions.create({ model: MODEL, messages, temperature })
     return response.choices?.[0]?.message?.content ?? ''
 }
 
+/**
+ * Parse a ReAct "Action" / "Action Input" pair out of the model's raw output.
+ * @param {string} text - Raw assistant output for one iteration.
+ * @returns {{action: string, actionInput: string} | null} The tool name and its input, or null if no Action line is present.
+ */
 function extractAction(text) {
     const actionMatch = text.match(/^Action:\s*(.+)$/im)
     if (!actionMatch) return null
@@ -32,6 +43,11 @@ function extractAction(text) {
     }
 }
 
+/**
+ * Parse a ReAct "Final Answer" out of the model's raw output, signalling the loop should end.
+ * @param {string} text - Raw assistant output for one iteration.
+ * @returns {string | null} The final answer text, or null if the output is not a final answer.
+ */
 function extractFinalAnswer(text) {
     const match = text.match(/^Final Answer:\s*([\s\S]*)$/im)
     return match ? match[1].trim() : null
@@ -39,6 +55,13 @@ function extractFinalAnswer(text) {
 
 // ─── Standard tools ───────────────────────────────────────────────────────────
 
+/**
+ * Safely evaluate a bare arithmetic expression supplied by the LLM (used to resolve
+ * math embedded in coordinates/rewards before deciding). Strips surrounding quotes and
+ * trailing unit labels, rejects anything that is not pure arithmetic, then evals.
+ * @param {string} expression - Arithmetic string, possibly quoted or suffixed with "pts".
+ * @returns {string} The numeric result as a string, or an "Error: ..." description.
+ */
 function calculate(expression) {
     try {
         // LLM often wraps the input in quotes ("4*2") or adds spaces/unit suffixes — strip them
@@ -58,6 +81,12 @@ function calculate(expression) {
     }
 }
 
+/**
+ * Tool: report the agent's current position, score and basic map info to the LLM.
+ * @param {object} beliefs - The BeliefSet (reads beliefs.map delivery/spawn tile counts).
+ * @param {() => {x: number, y: number, score: number}} getState - Returns the agent's live state.
+ * @returns {string} JSON `{x, y, score, mapInfo}`, or an "Error: ..." string.
+ */
 function getAgentState(beliefs, getState) {
     try {
         const { x, y, score } = getState()
@@ -74,6 +103,12 @@ function getAgentState(beliefs, getState) {
     }
 }
 
+/**
+ * Tool: write a positive utility for a tile so the BDI loop generates a GOTO desire toward it.
+ * @param {string} input - JSON `{"x": N, "y": N, "utility": N}` (utility must be > 0).
+ * @param {object} beliefs - The BeliefSet (writes into beliefs.tileUtilities).
+ * @returns {string} Confirmation, or an "Error: ..." string on invalid input.
+ */
 function setTileUtility(input, beliefs) {
     try {
         const { x, y, utility } = JSON.parse(input)
@@ -91,6 +126,12 @@ function setTileUtility(input, beliefs) {
     }
 }
 
+/**
+ * Tool: send a free-text reply back to the mission sender.
+ * @param {string} message - The text to send.
+ * @param {(message: string) => void} replyFn - Reply channel to the sender.
+ * @returns {string} Confirmation, or an "Error: ..." string if no channel is available.
+ */
 function replyToSender(message, replyFn) {
     if (!replyFn) return 'Error: no reply channel available'
     try {
@@ -103,6 +144,12 @@ function replyToSender(message, replyFn) {
 
 // ─── L2 Mission tools ─────────────────────────────────────────────────────────
 
+/**
+ * L2 tool: constrain how many parcels the agent carries before delivering (stack mission).
+ * @param {string} input - JSON `{"min": N|null, "max": N|null}` (positive integers or null).
+ * @param {object} beliefs - The BeliefSet (writes beliefs.missionConstraints.stack).
+ * @returns {string} Confirmation, or an "Error: ..." string on invalid input.
+ */
 function setStackRequirement(input, beliefs) {
     try {
         const { min, max } = JSON.parse(input)
@@ -119,6 +166,12 @@ function setStackRequirement(input, beliefs) {
     }
 }
 
+/**
+ * L2 tool: whitelist delivery tiles and apply a reward multiplier when delivering there.
+ * @param {string} input - JSON `{"tiles": [{"x":N,"y":N},...], "multiplier": M}` (multiplier defaults to 1).
+ * @param {object} beliefs - The BeliefSet (writes beliefs.missionConstraints.preferred).
+ * @returns {string} Confirmation listing the tiles, or an "Error: ..." string.
+ */
 function setPreferredDeliveryTiles(input, beliefs) {
     try {
         const { tiles, multiplier } = JSON.parse(input)
@@ -138,6 +191,12 @@ function setPreferredDeliveryTiles(input, beliefs) {
     }
 }
 
+/**
+ * L2 tool: mark a delivery tile as scoring 0 so it is removed from the effective delivery list.
+ * @param {string} input - JSON `{"x": N, "y": N}`.
+ * @param {object} beliefs - The BeliefSet (writes beliefs.missionConstraints.blacklist).
+ * @returns {string} Confirmation, or an "Error: ..." string on invalid input.
+ */
 function blacklistDeliveryTile(input, beliefs) {
     try {
         const { x, y } = JSON.parse(input)
@@ -151,11 +210,14 @@ function blacklistDeliveryTile(input, beliefs) {
     }
 }
 
+/**
+ * L2 tool: cap parcel reward so the agent skips parcels worth more than the cap.
+ * @param {string} input - Bare number ("10") or JSON `{"cap":N,"mode":"single"|"stack","gate":"sum"|"each"}`.
+ * @param {object} beliefs - The BeliefSet (writes beliefs.missionConstraints.rewardCap).
+ * @returns {string} Confirmation describing cap/mode/gate, or an "Error: ..." string.
+ */
 function setRewardCap(input, beliefs) {
     try {
-        // Accept a bare number ("10") or a JSON object {"cap":N,"mode":"single|stack","gate":"sum|each"}.
-        // ReAct passes Action Input verbatim — a quoted "10" arrives as the literal string '"10"'; strip
-        // surrounding quotes/whitespace first so JSON.parse/parseFloat don't choke on them.
         const cleaned = String(input).trim().replace(/^["']|["']$/g, '')
         let cap, mode = null, gate = null
         let parsed
@@ -178,6 +240,12 @@ function setRewardCap(input, beliefs) {
     }
 }
 
+/**
+ * L2 tool: add a tile to the forbidden set so pathfinding avoids it and it is excluded as a delivery target.
+ * @param {string} input - JSON `{"x": N, "y": N}`.
+ * @param {object} beliefs - The BeliefSet (writes beliefs.missionConstraints.forbidden).
+ * @returns {string} Confirmation, or an "Error: ..." string on invalid input.
+ */
 function addForbiddenTile(input, beliefs) {
     try {
         const { x, y } = JSON.parse(input)
@@ -191,6 +259,14 @@ function addForbiddenTile(input, beliefs) {
     }
 }
 
+/**
+ * L2 tool: toggle the red-light freeze flag. On green light, also releases any active
+ * coordination and relays the release to the peer.
+ * @param {string} input - "true" (red light / freeze) or "false" (green light / resume).
+ * @param {object} beliefs - The BeliefSet (writes redLight, may reset coordination).
+ * @param {{sendToPeer?: Function}|null} coordinationCtx - Peer channel; used to relay release on green light.
+ * @returns {string|boolean} Status message, or an "Error: ..." string on invalid input.
+ */
 function setMovementFreeze(input, beliefs, coordinationCtx) {
     const val = input.trim().toLowerCase().replace(/^["']+|["']+$/g, '')
     if (!['true', 'false'].includes(val)) return 'Error: input must be "true" (red light / stop) or "false" (green light / go)'
@@ -207,11 +283,21 @@ function setMovementFreeze(input, beliefs, coordinationCtx) {
         : 'Green light: movement resumed. Coordination released. Relayed to peer if applicable.'
 }
 
+/**
+ * L2 tool: return a snapshot of all active mission constraints.
+ * @param {object} beliefs - The BeliefSet (reads beliefs.missionConstraints).
+ * @returns {string} JSON of the constraints plus `hasMission`.
+ */
 function getMissionState(beliefs) {
     const c = beliefs.missionConstraints
     return JSON.stringify({ ...c.toJSON(), hasMission: c.hasMission() })
 }
 
+/**
+ * L2 tool: clear every mission constraint, returning the agent to standard play.
+ * @param {object} beliefs - The BeliefSet (resets beliefs.missionConstraints).
+ * @returns {string} Confirmation message.
+ */
 function resetMission(beliefs) {
     beliefs.missionConstraints.reset()
     return 'Mission reset — all constraints cleared, returning to standard play'
@@ -219,6 +305,14 @@ function resetMission(beliefs) {
 
 // ─── L3 Coordination tools (master only) ─────────────────────────────────────
 
+/**
+ * L3 tool (master): resolve the peer agent's id, name and position from beliefs, preferring
+ * the agent matching PEER_AGENT_NAME / PEER_AGENT_ID over any random sensed NPC.
+ * @param {object} beliefs - The BeliefSet (reads beliefs.agents).
+ * @param {() => {x: number, y: number}} getState - Returns the agent's own position.
+ * @param {{getPeerAgentId?: Function}|null} coordinationCtx - Optional peer-id resolver.
+ * @returns {string} JSON `{peerId, peerName, peerPosition, myPosition, hint}`, or an "Error: ..." string.
+ */
 function getPeerInfo(beliefs, getState, coordinationCtx) {
     try {
         const { x, y } = getState()
@@ -245,6 +339,14 @@ function getPeerInfo(beliefs, getState, coordinationCtx) {
     }
 }
 
+/**
+ * L3 tool (master): start a meet_and_wait rendezvous. Writes a dominating utility on the
+ * nearest walkable tile to the target so the BDI loop navigates there, and commands the peer.
+ * @param {string} input - JSON `{"x":N,"y":N,"maxDist":3}` (maxDist defaults to 3).
+ * @param {object} beliefs - The BeliefSet (writes coordination state and tileUtilities).
+ * @param {{sendToPeer: Function, notifyBeliefChanged?: Function}|null} coordinationCtx - Peer channel; required (master only).
+ * @returns {string} Confirmation, or an "Error: ..." string (incl. when not master).
+ */
 function setRendezvous(input, beliefs, coordinationCtx) {
     try {
         const { x, y, maxDist = 3 } = JSON.parse(input)
@@ -262,6 +364,13 @@ function setRendezvous(input, beliefs, coordinationCtx) {
     }
 }
 
+/**
+ * L3 tool (master): start a parcel_handoff mission as the passer, commanding the peer to be receiver.
+ * @param {string} _input - Unused (no params required).
+ * @param {object} beliefs - The BeliefSet (writes coordination handoff state).
+ * @param {{sendToPeer: Function}|null} coordinationCtx - Peer channel; required (master only).
+ * @returns {string} Confirmation, or an "Error: ..." string when not configured as master.
+ */
 function initiateHandoff(_input, beliefs, coordinationCtx) {
     if (!coordinationCtx?.sendToPeer) return 'Error: not configured as master (sendToPeer unavailable)'
     beliefs.missionConstraints.coordination.setHandoff('passer')
@@ -269,6 +378,14 @@ function initiateHandoff(_input, beliefs, coordinationCtx) {
     return 'Handoff initiated. I am passer, peer is receiver. I will pick up a parcel, then freeze in place until peer arrives in sensing range, then drop for peer to deliver.'
 }
 
+/**
+ * L3 tool (master): start an odd_row_wait mission. Navigates the agent to its nearest odd-row
+ * tile (dominating utility) and commands the peer to do the same, then both freeze.
+ * @param {object} beliefs - The BeliefSet (writes coordination state and tileUtilities).
+ * @param {() => object} _getState - Unused.
+ * @param {{sendToPeer: Function, notifyBeliefChanged?: Function, findNearestOddRowTile?: Function}|null} coordinationCtx - Peer channel; required (master only).
+ * @returns {string} Confirmation, or an "Error: ..." string when not configured as master.
+ */
 function setOddRowFreeze(beliefs, _getState, coordinationCtx) {
     try {
         if (!coordinationCtx?.sendToPeer) return 'Error: not configured as master (sendToPeer unavailable)'
@@ -285,6 +402,17 @@ function setOddRowFreeze(beliefs, _getState, coordinationCtx) {
     }
 }
 
+/**
+ * Tool: compute the expected value (EV) of a mission from live game statistics and return a
+ * deterministic ACCEPT/REJECT recommendation. The LLM must call this before committing to a mission.
+ * Normalizes rolling stats (capping points-per-second so coordination bonuses don't inflate it),
+ * delegates the math to `beliefs.missionConstraints.computeEV`, and attaches a per-type note.
+ * @param {string} input - JSON with a "type" field plus per-type params (see system prompt).
+ * @param {object} beliefs - The BeliefSet (reads missionConstraints.computeEV).
+ * @param {() => {avgReward, movementDuration, capacity, pointsPerSecond}} getGameStats - Rolling game stats.
+ * @param {() => {x: number, y: number}} [getState] - Agent position (used by coordination EV).
+ * @returns {string} JSON `{ev, missionGain, standardGain, note, recommendation}`, or an "Error: ..." string.
+ */
 function evaluateMission(input, beliefs, getGameStats, getState) {
     try {
         const params = JSON.parse(input)
@@ -332,8 +460,6 @@ function evaluateMission(input, beliefs, getGameStats, getState) {
         return `Error: ${e.message}. Input was: ${input}`
     }
 }
-
-// ─── System prompt ────────────────────────────────────────────────────────────
 
 const MISSION_SYSTEM_PROMPT = `
 You are an AI assistant embedded in a BDI agent playing a parcel delivery game (Deliveroo.js).
@@ -477,8 +603,6 @@ Final Answer: <outcome summary>
 Never output Action and Final Answer in the same message. Never write "Action: None". Do not invent tool results.
 `.trim()
 
-// ─── Slave directive ──────────────────────────────────────────────────────────
-
 const SLAVE_DIRECTIVE = `
 You are the SLAVE agent. The MASTER orchestrates ALL TYPE 3 COORDINATION missions that
 involve both agents acting together: "meet at (x,y)" (meet_and_wait), "parcel handoff
@@ -492,8 +616,21 @@ red-light/stop). A plain "stop/freeze until I say go" (red_light, RULE 7) is NOT
 — handle it yourself by freezing your own movement.
 `.trim()
 
-// ─── Main export ──────────────────────────────────────────────────────────────
-
+/**
+ * Main entry point: interpret a mission message through a bounded ReAct loop (≤10 iterations).
+ * Builds the closed TOOLS registry, prepends the system prompt (plus the slave directive when
+ * role === 'slave'), then drives Thought/Action/Observation until the model emits a Final Answer
+ * or the iteration budget is exhausted. Side-effecting only — installs constraints via the tools.
+ * @param {string} senderName - Name of the agent/admin that sent the mission.
+ * @param {string} msg - Raw mission message text.
+ * @param {object} beliefs - The BeliefSet; the sole channel through which constraints are written.
+ * @param {() => {x: number, y: number, score: number}} getState - Returns the agent's live state.
+ * @param {(message: string) => void} replyFn - Reply channel back to the sender.
+ * @param {() => {avgReward, movementDuration, capacity, pointsPerSecond}} [getGameStats] - Rolling stats for EV.
+ * @param {{sendToPeer?, getPeerAgentId?, notifyBeliefChanged?, findNearestOddRowTile?}|null} [coordinationCtx] - Peer channel for L3 tools (master only).
+ * @param {'master'|'slave'} [role] - Coordination role; 'slave' defers TYPE 3 missions to the master.
+ * @returns {Promise<void>}
+ */
 export async function interpretMission(
     senderName, msg, beliefs, getState, replyFn,
     getGameStats = () => ({ avgReward: 10, movementDuration: 500, capacity: 5, pointsPerSecond: 1 }),
