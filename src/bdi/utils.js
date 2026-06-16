@@ -65,6 +65,15 @@ function bfsDistDirected(from, to, walkable, exitDirs) {
     return Infinity;
 }
 
+/**
+ * Computes a heat value for a spawn tile based on density of nearby spawn tiles.
+ * Higher heat = more spawn neighbors within `radius`.
+ * Uses inverse-distance weighting: closer neighbors contribute more (`1 / (1 + dist)`).
+ * @param {{ x:number, y:number }} tile - Target spawn tile.
+ * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOTile').IOTile[]} tiles - Full tile list.
+ * @param {number} radius - Euclidean radius to consider.
+ * @returns {number} Heat value (higher = denser spawn cluster).
+ */
 function computeSpawnHeat(tile, tiles, radius) {
     console.log(`Computing heat for spawn tile (${tile.x},${tile.y}) with radius ${radius}`);
     let heat = 0.0;
