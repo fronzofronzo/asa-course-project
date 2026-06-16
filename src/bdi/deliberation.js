@@ -484,10 +484,8 @@ async function stepToward(target, agent) {
         return 'stuck';
     }
 
-    const oldPos = `(${Math.round(agent.x)},${Math.round(agent.y)})`;
     agent.x = result.x;
     agent.y = result.y;
-    const newPos = `(${Math.round(agent.x)},${Math.round(agent.y)})`;
 
     if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
     return 'moved';

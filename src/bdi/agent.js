@@ -408,8 +408,6 @@ async function agentLoop() {
 
         // --- deliberation ---
         if (agent.shouldDeliberate() || agent.intention == null) {
-            const carriedBreakdown = agent.carriedParcels.map(p => `${p.id}:${p.reward.toFixed(1)}`).join(', ');
-            
             let newIntention = filterIntentions(desires, agent.intention, INTENTION_EPSILON);
 
             // Stick with Pickup intention if it's still valid and has higher utility than any new desire.

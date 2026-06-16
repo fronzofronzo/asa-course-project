@@ -1,6 +1,5 @@
 import { bfsDist, computeSpawnHeat} from './utils.js';
 import { MissionConstraints } from './llm/constraints/MissionConstraints.js';
-import { writeFileSync } from 'fs';
 
 const LAMBDA = 0.3;
 
@@ -104,19 +103,21 @@ class BeliefSet {
         return s;
     }
 
-     updateBeliefs({ agents, parcels, crates }) {
-      const before = new Set(this.parcels.keys());
-      this.updateAgents(agents);
-      this.updateParcels(parcels);
-      this.updateCrates(crates ?? []);
-      const after = new Set(this.parcels.keys());                                                                                                                                                                       
-   
-      const newParcels = [...after]
-        .filter(id => !before.has(id))
-        .map(id => this.parcels.get(id));
-      const lostParcelIds = [...before].filter(id => !after.has(id));                                                                                                                                                   
-      return { newParcels, lostParcelIds };
-    }   
+    /**
+     * Update beliefs with the latest sensing data.
+     * @param {{ agents: object[], parcels: object[], crates?: object[] }} sensing
+     * @returns {{ newParcels: object[], lostParcelIds: string[] }}
+     */
+    updateBeliefs({ agents, parcels, crates }) {
+        const before = new Set(this.parcels.keys());
+        this.updateAgents(agents);
+        this.updateParcels(parcels);
+        this.updateCrates(crates ?? []);
+        const after = new Set(this.parcels.keys());
+        const newParcels = [...after].filter(id => !before.has(id)).map(id => this.parcels.get(id));
+        const lostParcelIds = [...before].filter(id => !after.has(id));
+        return { newParcels, lostParcelIds };
+    }
 
     /**
      * Recompute beliefScore for every out-of-range parcel.
@@ -156,44 +157,42 @@ class BeliefSet {
 
     /**
      * Update the belief set with the latest map information.
- * @param {number} width
- * @param {number} height
- * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOTile').IOTile[]} tiles
- */
-updateMap(width, height, tiles) {
-    this.map.width = width;
-    this.map.height = height;
-    this.map.tiles.clear();
-    this.map.deliveryTiles = [];
-    this.map.spawnTiles = [];
-    this.map.walkable.clear();
-    this.map.exitDirs.clear();
-    this.map.pushTargets.clear();
-    this.crates.clear();
+     * @param {number} width
+     * @param {number} height
+     * @param {import('@unitn-asa/deliveroo-js-sdk/src/types/IOTile').IOTile[]} tiles
+     */
+    updateMap(width, height, tiles) {
+        this.map.width = width;
+        this.map.height = height;
+        this.map.tiles.clear();
+        this.map.deliveryTiles = [];
+        this.map.spawnTiles = [];
+        this.map.walkable.clear();
+        this.map.exitDirs.clear();
+        this.map.pushTargets.clear();
+        this.crates.clear();
 
-    const ARROW_DIR = { '↑': 'up', '↓': 'down', '←': 'left', '→': 'right' };
+        const ARROW_DIR = { '↑': 'up', '↓': 'down', '←': 'left', '→': 'right' };
 
-    for (const tile of tiles) {
-        const key = `${tile.x},${tile.y}`;
-        this.map.tiles.set(key, tile);
+        for (const tile of tiles) {
+            const key = `${tile.x},${tile.y}`;
+            this.map.tiles.set(key, tile);
 
-        if (tile.type == 0) continue;
+            if (tile.type == 0) continue;
 
-        this.map.walkable.add(key);
-        console.log(tile.type)
-        // crate sliding tile / spawner: the only cells a crate may be pushed onto (yellow)
-        if (tile.type === '5' || tile.type === '5!') this.map.pushTargets.add(key);
-        if (tile.type == 2) this.map.deliveryTiles.push(tile);
-        if (tile.type == 1) {
-            console.log("Questa è una spawining tile")
-            this.map.spawnTiles.push(tile);
-            this.map.spawnHeat.set(key, computeSpawnHeat(tile, tiles, 3));
+            this.map.walkable.add(key);
+            // crate sliding tile / spawner: the only cells a crate may be pushed onto (yellow)
+            if (tile.type === '5' || tile.type === '5!') this.map.pushTargets.add(key);
+            if (tile.type == 2) this.map.deliveryTiles.push(tile);
+            if (tile.type == 1) {
+                this.map.spawnTiles.push(tile);
+                this.map.spawnHeat.set(key, computeSpawnHeat(tile, tiles, 3));
+            }
+
+            const dir = ARROW_DIR[tile.type];
+            if (dir) this.map.exitDirs.set(key, new Set([dir]));
         }
-
-        const dir = ARROW_DIR[tile.type];
-        if (dir) this.map.exitDirs.set(key, new Set([dir]));
     }
-}
 
 }
 

@@ -75,7 +75,6 @@ function bfsDistDirected(from, to, walkable, exitDirs) {
  * @returns {number} Heat value (higher = denser spawn cluster).
  */
 function computeSpawnHeat(tile, tiles, radius) {
-    console.log(`Computing heat for spawn tile (${tile.x},${tile.y}) with radius ${radius}`);
     let heat = 0.0;
     for (const t of tiles) {
         
