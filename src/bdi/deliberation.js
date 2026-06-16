@@ -15,10 +15,7 @@ function parseCell(name) {
 }
 
 /**
- * Validate a planned PDDL step against current beliefs, driven by the step's declared
- * action (not by guessing from beliefs). A PDDL plan provably reaches the goal, so the
- * only thing that can break it is the live world having drifted from the solve snapshot.
- * Returns true if the step's preconditions still hold and it can be emitted now.
+ * Validate a planned PDDL step against current beliefs, driven by the step's declared action (not by guessing from beliefs). 
  */
 function planStepValid(beliefs, step) {
     const a = String(step?.action ?? '').toLowerCase();
@@ -59,41 +56,38 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
 
 
 const BELIEF_THRESHOLD = 0.1;
-
 const UNREACHABLE_PENALTY_BASE = 100;
-const UNREACHABLE_PENALTY_TAU  = 5; // seconds — penalty halves every ~3.5s, ~0 after ~20s
+const UNREACHABLE_PENALTY_TAU  = 5; 
 /**
- * Compute utility for a parcel target.
- * U(p) = reward(p) - decay*steps_to_p - decay*steps_to_delivery(p) - decay*steps_to_p*carried_count - agent_proximity_penalty
- * @param {{ x:number, y:number, reward:number }} parcel
- * @param {{ x:number, y:number }} agentPos
- * @param {number} carriedCount
- * @param {{ x:number, y:number }[]} deliveryTiles
- * @param {Set<string>} walkable
- * @param {number} decay
- * @param {Map<string, { id, name, x, y }>} otherAgents  other agents in sensing range
- * @returns {number}
+* Compute utility of picking up a parcel, considering:
+* - Belief score (uncertainty about parcel's existence)
+* - Steps to parcel and delivery (accessibility)
+* - Decayed reward (time-sensitive value)
+* - Detour cost if carrying other parcels (stacking constraints)
+* - Penalty for parcels marked unreachable (with decay over time)
+* Returns -Infinity if pickup is not viable under current beliefs and constraints.
+* @param {object} parcel  parcel belief object
+* @param {{ x:number, y:number }} agentPos  current agent position
+* @param {number} carriedCount  how many parcels currently carried (for stacking cost)
+* @param {{ x:number, y:number }[]} deliveryTiles  available delivery locations
+* @param {Set<string>} walkable  set of "x,y" walkable keys for pathfinding
+* @param {number} decay  reward decay per second
+* @param {Map<string, object>} otherAgents  belief agents (for accessibility checks)
+* @param {object|null} constraints  mission constraints (for accessibility checks)
+* @param {Map<string, number>|null} unreachableParcels  optional map of parcelId → timestamp when marked unreachable (for penalty)
  */
 function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map(), constraints = null, unreachableParcels = null) {
-    // parcel with low belief score is probably gone — skip immediately
     if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
-    // reward cap is enforced at delivery (hold-and-decay), not at pickup — over-cap parcels are collectable
 
     const stepsToParcel = bfsDist(agentPos, parcel, walkable);
     if (stepsToParcel === Infinity) return -Infinity;
 
     const stepsToDelivery = distToNearestDelivery(parcel, deliveryTiles, walkable);
     if (stepsToDelivery === Infinity) return -Infinity;
-
-    // gameReward: actual reward the server will give if we reach the parcel now
     const stepsSinceLastSeen = (Date.now() - parcel.lastSeen) / 1000;
     const gameReward = Math.max(0, parcel.reward - decay * stepsSinceLastSeen);
 
-    // deliverability: the reward decays while we walk to it AND on to a delivery tile.
-    // If it would hit 0 before we can deliver, the parcel expires in transit (wasted trip) → never pick it.
     if (gameReward - decay * (stepsToParcel + stepsToDelivery) <= 0) return -Infinity;
-
-    // effectiveReward: expected value = gameReward * P(parcel still exists)
     const effectiveReward = gameReward * (parcel.beliefScore ?? 1.0);
 
     const stepsToDeliveryNow = carriedCount > 0
@@ -127,29 +121,27 @@ function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable,
  * @param {number} carriedReward
  * @param {number} decay
  * @param {number} threshold
- * @returns {{ type: string, id: string, utility: number }[]}
+ * @param {Map<string, number>|null} unreachableParcels  optional map of parcelId → timestamp when marked unreachable (for penalty)
+ * @param {Set<string>|null} hardBlacklist  optional set of parcelIds to exclude from desires (e.g. recently failed pickups)
+ * @return {{ type:string, id:string, utility:number, parcel?:object, tile?:object, over?:boolean }[]} desires sorted by utility desc
  */
 function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, threshold, unreachableParcels = null, hardBlacklist = null) {
-    // Snap to the nearest tile: mid-move the server reports fractional coords (0.6/0.4 steps),
-    // which bfsDist can't key into the walkable set → every parcel scores Infinity → empty
-    // option list → intention cleared every other tick (ping-pong). Round before pathfinding.
     agentPos = { x: Math.round(agentPos.x), y: Math.round(agentPos.y) };
     const { deliveryTiles, walkable } = beliefs.map;
     const constraints = beliefs.missionConstraints ?? null;
     const effectiveDeliveryTiles = getEffectiveDeliveryTiles(deliveryTiles, constraints);
     const desires = [];
 
-    // PICKUP desires — skip entirely if stack.max reached
-    const atStackMax = constraints?.stack?.max !== null && constraints?.stack?.max !== undefined
-        && carriedCount >= constraints.stack.max;
+    const atStackMax = constraints?.stack?.max !== null 
+    && constraints?.stack?.max !== undefined
+    && carriedCount >= constraints.stack.max;
     const rewardCap = constraints?.rewardCap;
     const capActive = rewardCap?.cap != null;
     const now = Date.now();
     if (!atStackMax) {
         for (const parcel of beliefs.parcels.values()) {
             if (parcel.carriedBy !== null) continue;
-            if (hardBlacklist?.has(parcel.id)) continue; // hard skip: handoff-dropped parcels
-            // reward cap: gate pickup by mode (single/stack) using the parcel's live decayed reward
+            if (hardBlacklist?.has(parcel.id)) continue; 
             let over = false;
             if (capActive) {
                 const liveR = Math.max(0, parcel.reward - decay * (now - parcel.lastSeen) / 1000);
@@ -158,30 +150,17 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
             }
             const utility = computeUtility(parcel, agentPos, carriedCount, effectiveDeliveryTiles, walkable, decay, beliefs.agents, constraints, unreachableParcels);
             if (utility > threshold) {
-                // Rank against DELIVER on a marginal basis: while carrying, the load is delivered
-                // either way, so a pickup's ranking value = carriedReward + its own standalone value.
-                // Without this, DELIVER (≈carriedReward) always beats any pickup worth less than the
-                // whole current load → the agent never tops up with cheap parcels on its route.
-                // Threshold/deliverability still gated on the standalone `utility` above.
                 const rankU = carriedCount > 0 && utility !== -Infinity ? utility + carriedReward : utility;
                 desires.push({ type: 'PICKUP', id: parcel.id, parcel, utility: rankU, over });
             }
         }
     }
 
-    // reward cap hybrid: if any sub-cap parcel is collectable, drop the over-cap ones
-    // (expensive parcels are only chased as a fallback when nothing cheap is available)
     if (capActive && desires.some(d => d.type === 'PICKUP' && !d.over)) {
         for (let i = desires.length - 1; i >= 0; i--) {
             if (desires[i].type === 'PICKUP' && desires[i].over) desires.splice(i, 1);
         }
     }
-
-    // DELIVER desire — first-class option whenever carrying & stack constraint satisfied.
-    // It competes with PICKUP desires by utility + hysteresis (NOT gated on "no pickups visible").
-    // Gating it on desires.length===0 made DELIVER vanish whenever any parcel — even a cheap one —
-    // flickered into sensing range, flipping the agent between delivering and chasing → ping-pong
-    // near the delivery zone. Always emitting it lets a stable DELIVER U arbitrate against pickups.
     if (carriedCount > 0) {
         const stackMin = constraints?.stack?.min ?? null;
         const stackReady = stackMin === null || carriedCount >= stackMin;
@@ -191,11 +170,8 @@ function generateOptions(beliefs, agentPos, carriedCount, carriedReward, decay, 
             const utility = distDel === Infinity ? -Infinity : carriedReward - decay * distDel;
             desires.push({ type: 'DELIVER', id: 'DELIVER', utility });
         }
-        // if !stackReady: no DELIVER → agent keeps collecting toward stack.min
-        // true deadlock (no parcels ever) is handled by the execution guard in agent.js
     }
 
-    // GOTO desires — LLM-injected tile goals
     for (const [key, utility] of beliefs.tileUtilities) {
         const [x, y] = key.split(',').map(Number);
         desires.push({ type: 'GOTO', id: `GOTO:${key}`, tile: { x, y }, utility });
@@ -261,10 +237,6 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
     for (const key of forbiddenTiles) blocked.add(key);
     for (const key of crateCells) blocked.add(key); // crates block A*; PDDL fallback pushes them
     blocked.delete(goalKey);
-    if (blocked.size > 0) {
-        console.log(`[PATHFIND] ${blocked.size} tile(s) blocking (agents + forbidden + crates)`);
-    }
-
     const h = (x, y) => Math.abs(x - gx) + Math.abs(y - gy);
     const dirs = [
         { dx:  0, dy:  1, dir: 'up'    },
@@ -283,7 +255,6 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
         const key = `${x},${y}`;
 
         if (key === goalKey) {
-            console.log(`[PATHFIND] ✓ Found path (${path.length} steps): [${path.slice(0, 10).join(',')}${path.length > 10 ? '...' : ''}]`);
             return path;
         }
         if ((visited.get(key) ?? Infinity) <= g) continue;
@@ -300,7 +271,6 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
             open.push([ng + h(nx, ny), ng, nx, ny, [...path, dir]]);
         }
     }
-    console.warn(`[PATHFIND] ✗ No path found (open list exhausted) from (${sx},${sy}) to (${gx},${gy})`);
     return null;
 }
 
@@ -312,12 +282,10 @@ function computePath(from, to, walkable, exitDirs, knownAgents, forbiddenTiles =
  */
 async function go_to(target, agent) {
     if (agent.beliefs.missionConstraints?.isMovementFrozen?.()) {
-        console.warn('[go_to] Movement frozen (red light) — aborting navigation');
         return false;
     }
     while (true) {
         if (agent.beliefs.missionConstraints?.isMovementFrozen?.()) {
-            console.warn('[go_to] Movement frozen mid-path (red light) — stopping');
             return false;
         }
         const path = computePath(
@@ -329,7 +297,6 @@ async function go_to(target, agent) {
         );
 
         if (path === null) {
-            console.warn(`go_to(${target.x},${target.y}): unreachable`);
             return false;
         }
         if (path.length === 0) return true;
@@ -338,11 +305,9 @@ async function go_to(target, agent) {
         try {
             result = await agent.socket.emitMove(path[0]);
         } catch (e) {
-            console.warn(`go_to: move ${path[0]} threw: ${e.message} — replanning`);
             continue;
         }
         if (result === false) {
-            console.warn(`go_to: move ${path[0]} failed, replanning`);
             continue;
         }
 
@@ -363,7 +328,6 @@ async function go_to(target, agent) {
  */
 async function stepToward(target, agent) {
     if (agent.beliefs.missionConstraints?.isMovementFrozen?.()) {
-        console.warn('[stepToward] Movement frozen (red light) — aborting step');
         return 'stuck';
     }
     const from = { x: agent.x, y: agent.y };
@@ -371,10 +335,8 @@ async function stepToward(target, agent) {
     
     const targetKey = `${to.x},${to.y}`;
     const isWalkable = agent.beliefs.map.walkable.has(targetKey);
-    console.log(`[STEPTOWARD] Target (${to.x},${to.y}) walkable: ${isWalkable}`);
     
     if (!isWalkable) {
-        console.warn(`[STEPTOWARD] ✗ Target (${to.x},${to.y}) is NOT walkable!`);
         return 'stuck';
     }
     
@@ -392,7 +354,7 @@ async function stepToward(target, agent) {
 
     if (path === null) {
         // A* failed. Is a crate the blocker? If a path exists when we ignore crates,
-        // a crate stands in the way → ask the PDDL planner to push it (Sokoban-style).
+        // a crate stands in the way → ask the PDDL planner to push it 
         if (crateCells.size > 0) {
             const pathNoCrates = computePath(
                 { x: agent.x, y: agent.y }, target,
@@ -403,7 +365,6 @@ async function stepToward(target, agent) {
                 const goalKey = `${target.x},${target.y}`;
                 const failures = (agent._cratePlanFailures ??= new Map());
 
-                // Backoff: don't re-run the ~9s online solve every cycle on a dead snapshot.
                 const back = failures.get(goalKey);
                 if (back && Date.now() < back.until && (!agent._cratePlan || agent._cratePlan.goalKey !== goalKey)) {
                     console.warn(`[PDDL] backoff ${goalKey} (${Math.ceil((back.until - Date.now()) / 1000)}s left) — skipping solve`);
@@ -417,9 +378,6 @@ async function stepToward(target, agent) {
                     failures.set(goalKey, { count, until: Date.now() + wait });
                 };
 
-                // The online solver is slow (network). Solve once and cache the FULL plan
-                // steps (action + cells), so we can validate each step by its declared
-                // intent (MOVE vs PUSH) against live beliefs before emitting.
                 const solveFromHere = async () => {
                     console.log(`[PDDL] crate blocks path to (${target.x},${target.y}) — planning push from (${Math.round(agent.x)},${Math.round(agent.y)})`);
                     const plan = await planCrateMove(agent.beliefs, { x: agent.x, y: agent.y }, target);
@@ -442,24 +400,18 @@ async function stepToward(target, agent) {
                     }
                 }
 
-                // Drain the plan faithfully. A PDDL plan provably reaches the goal, so a
-                // crate can never be left blocking us. The only failure mode is the live
-                // world having drifted from the solve snapshot (e.g. a crate sensed mid-route
-                // on a cell the plan assumed empty) → re-solve from the current position;
-                // the fresh plan naturally pushes that crate aside.
                 const moveDur = agent.gameConfig?.player?.movement_duration ?? 500;
                 let replans = 0;
                 let progressed = false;
                 const yieldOrFail = () => {
-                    if (progressed) return 'moved';        // made headway — BDI re-enters and continues
-                    noteFailure();                          // stuck with no progress — arm backoff
+                    if (progressed) return 'moved';        
+                    noteFailure();                          
                     return 'unreachable';
                 };
                 while (cache.steps.length > 0) {
                     const step = cache.steps[0];
                     const dir = actionToDirection(step);
 
-                    // Step's planned precondition no longer holds in live beliefs → re-solve.
                     if (!planStepValid(agent.beliefs, step)) {
                         agent._cratePlan = null;
                         if (replans++ >= CRATE_MAX_INCALL_REPLANS) {
@@ -482,10 +434,8 @@ async function stepToward(target, agent) {
                     if (result === false) {
                         agent._cratePlan = null;
                         if (replans++ >= CRATE_MAX_INCALL_REPLANS) {
-                            console.warn(`[PDDL] ${step.action} rejected by server, replan budget spent — yielding`);
                             return yieldOrFail();
                         }
-                        console.warn(`[PDDL] ${step.action} rejected by server — re-solving from (${Math.round(agent.x)},${Math.round(agent.y)})`);
                         cache = await solveFromHere();
                         if (!cache) return yieldOrFail();
                         continue;
@@ -505,15 +455,9 @@ async function stepToward(target, agent) {
         console.warn(`[PATHFIND] ✗ No path from (${Math.round(agent.x)},${Math.round(agent.y)}) to (${target.x},${target.y})`);
         return 'unreachable';
     }
-    // Normal A* path available → no crate blocking; drop any stale push plan.
     if (agent._cratePlan) agent._cratePlan = null;
-    if (path.length === 0) {
-        console.log(`[PATHFIND] ✓ Already at target (${target.x},${target.y})`);
-        return 'arrived';
-    }
 
     const nextMove = path[0];
-    console.log(`[PATHFIND] Path: [${path.slice(0, 5).join(',')}${path.length > 5 ? '...' : ''}] (${path.length} steps) → next move: ${nextMove}`);
     
     let newX = Math.round(agent.x);
     let newY = Math.round(agent.y);
@@ -525,10 +469,8 @@ async function stepToward(target, agent) {
     }
     const nextTileKey = `${newX},${newY}`;
     const nextTileWalkable = agent.beliefs.map.walkable.has(nextTileKey);
-    console.log(`[STEPTOWARD] Next tile (${nextTileKey}) walkable: ${nextTileWalkable}`);
     
     if (!nextTileWalkable) {
-        console.warn(`[STEPTOWARD] ✗ Next move ${nextMove} leads to NON-walkable tile ${nextTileKey}!`);
         return 'stuck';
     }
     
@@ -536,11 +478,9 @@ async function stepToward(target, agent) {
     try {
         result = await agent.socket.emitMove(nextMove);
     } catch (e) {
-        console.warn(`[MOVE] ✗ ${nextMove} threw: ${e.message} — treating as stuck`);
         return 'stuck';
     }
     if (result === false) {
-        console.warn(`[MOVE] ✗ Move ${nextMove} failed at (${Math.round(agent.x)},${Math.round(agent.y)})`);
         return 'stuck';
     }
 
@@ -548,8 +488,6 @@ async function stepToward(target, agent) {
     agent.x = result.x;
     agent.y = result.y;
     const newPos = `(${Math.round(agent.x)},${Math.round(agent.y)})`;
-
-    console.log(`[MOVE] ✓ ${nextMove}: ${oldPos} → ${newPos}`);
 
     if (Math.round(agent.x) === target.x && Math.round(agent.y) === target.y) return 'arrived';
     return 'moved';
