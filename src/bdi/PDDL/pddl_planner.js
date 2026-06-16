@@ -131,19 +131,3 @@ export function actionToDirection(step) {
     return null;
 }
 
-// ─── Standalone smoke test: node src/bdi/PDDL/pddl_planner.js ──────────────────
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
-    // 5-cell corridor: agent (0,0), crate (1,0), goal (3,0), free cell (4,0)
-    // beyond. Agent must push the crate right past the goal to reach (3,0).
-    const walkable = new Set(['0,0', '1,0', '2,0', '3,0', '4,0']);
-    const mockBeliefs = {
-        map: { walkable, exitDirs: new Map(), pushTargets: new Set(['1,0', '2,0', '3,0', '4,0']) },
-        crateCells: () => new Set(['1,0']),
-    };
-    const from = { x: 0, y: 0 }, to = { x: 3, y: 0 };
-    console.log('PROBLEM:\n' + buildProblem(mockBeliefs, from, to));
-    planCrateMove(mockBeliefs, from, to).then(plan => {
-        console.log('\nRAW PLAN:', JSON.stringify(plan, null, 2));
-        if (plan) console.log('DIRS:', plan.map(actionToDirection));
-    });
-}
