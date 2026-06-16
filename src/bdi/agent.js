@@ -1,11 +1,11 @@
 import 'dotenv/config'
 import { BeliefSet } from './belief.js';
-import { generateOptions, filterIntentions, stepToward } from './deliberation.js';
-import { nearestDeliveryTile, computeBestSpawnTile } from './planner.js';
-import { getEffectiveDeliveryTiles, nearestWalkableWithin } from './utils.js';
+import { generateOptions, filterIntentions } from './deliberation.js';
+import { nearestWalkableWithin } from './utils.js';
 import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk/client";
 import { interpretMission } from './llm/mission_interpreter.js';
 import { log, setLoggerName, logOptions } from './logger.js';
+import { plans } from './plans/index.js';
 
 
 const DECAY = parseFloat(process.env.DECAY_RATE) || 0.1;
@@ -123,10 +123,12 @@ async function safeEmit(fn, label) {
     }
 }
 
-const visitedSpawns = new Map(); // key: "x,y" (spawn tile coords) → value: Date.now() of last visit                         
-const unreachableDeliveryTiles = new Map(); // key: "x,y" (delivery tile coords) → value: Date.now() when marked unreachable 
-const unreachableParcels = new Map(); // key: parcel id (string) → value: Date.now() when marked unreachable                 
+const visitedSpawns = new Map(); // key: "x,y" (spawn tile coords) → value: Date.now() of last visit
+const unreachableDeliveryTiles = new Map(); // key: "x,y" (delivery tile coords) → value: Date.now() when marked unreachable
+const unreachableParcels = new Map(); // key: parcel id (string) → value: Date.now() when marked unreachable
 const handoffDropped = new Set(); // hard blacklist: parcels dropped by passer, not to be re-picked up until receiver gets them
+
+const ctx = { visitedSpawns, unreachableDeliveryTiles, unreachableParcels, handoffDropped, safeEmit };
 
 
 let llmBusy = false;
@@ -368,25 +370,22 @@ agent.socket.onMsg(async (senderId, name, msg, ack) => {
  *
  * Each iteration executes three phases in order:
  *
- * 1. **Deliberation** :
+ * 1. **Deliberation** (rate-limited by DELIBERATION_INTERVAL or belief change flag):
  *    Calls `generateOptions` + `filterIntentions` to pick the best intention.
- *    A held PICKUP intention survives if still valid and no better option exists.
+ *    survives if still valid and no better option exists.
  *
  * 2. **Coordination state checks** (before execution):
  *    - Rendezvous: freeze (redLight) when within `maxDist` of target; master releases both after dwell.
  *    - Odd-row wait: freeze when on any odd-y tile; signal peer.
  *    - Passer handoff: freeze in place, signal position to receiver, drop once receiver is visible.
  *
- * 3. **Execution** (one action per iteration, exclusive branches):
- *    - `DELIVER`  — navigate to nearest effective delivery tile; `put_down` on arrival.
- *                   Respects `rewardCap` (hold until decay) and `stackMin` (wait for more parcels).
- *    - `PICKUP`   — navigate to parcel tile; `pick_up` on arrival.
- *                   Respects `stackMax` (drop excess immediately after pickup).
- *    - `GOTO`     — navigate to a coordination-injected tile (tileUtilities); clear on arrival.
- *    - Exploration — `computeBestSpawnTile` heatmap; marks visited spawns + neighbors within dist 2.
+ * 3. **Execution** — delegates to the plan library (`plans/index.js`).
+ *    Finds the first applicable plan via `plan.applicable(intention)` and calls `plan.execute(agent, ctx)`.
+ *    Plans: DeliverPlan | PickupPlan | GotoPlan | ExplorePlan (fallback when intention is null).
+ *    `ctx` carries shared execution state: visitedSpawns, unreachableDeliveryTiles,
+ *    unreachableParcels, handoffDropped, safeEmit.
  *
- * Stuck detection: 5 consecutive failed moves → mark target unreachable, clear intention.
- * Movement freeze: skips execution when `missionConstraints.isMovementFrozen()
+ * Movement freeze: skips execution when `missionConstraints.isMovementFrozen()`.
  */
 async function agentLoop() {
     console.log('Agent loop started — executing continuously with periodic deliberation...');
@@ -504,144 +503,10 @@ async function agentLoop() {
         }
 
         // --- execution (continuous, one step per iteration) ---
-        if (agent.intention?.type === 'DELIVER') {
-            const effectiveDelivery = getEffectiveDeliveryTiles(agent.beliefs.map.deliveryTiles, agent.beliefs.missionConstraints ?? null);
-            const onDelivery = effectiveDelivery
-                .some(t => t.x === Math.round(agent.x) && t.y === Math.round(agent.y));
+        const plan = plans.find(p => p.applicable(agent.intention));
+        if (plan) await plan.execute(agent, ctx);
 
-            // Agent is in some delivery tile.
-            if (onDelivery) {
-                const rewardCap = agent.beliefs.missionConstraints?.rewardCap;
-                const stackMin = agent.beliefs.missionConstraints?.stack?.min ?? null;
-                if (rewardCap?.mustHold?.(agent.carriedParcels)) {
-                    agent.stuckCount = 0;
-                } else if (stackMin !== null && carriedCount < stackMin) {
-                    const uncarriedExists = [...agent.beliefs.parcels.values()].some(p => p.carriedBy === null);
-                    agent.intention = null;
-                } else {
-                    const dropped = await safeEmit(() => agent.socket.emitPutdown(), 'PUTDOWN');
-                    agent.stuckCount = 0;
-                    agent.intention = null;
-                }
-            } else {
-                const target = nearestDeliveryTile(agent, unreachableDeliveryTiles);
-                if (target) {
-                    const status = await stepToward(target, agent);
-                    if (status === 'unreachable') {
-                        unreachableDeliveryTiles.set(`${target.x},${target.y}`, Date.now());
-                        agent.stuckCount = 0;
-                        agent.needsDeliberation = true;
-                    } else if (status === 'stuck') {
-                        agent.stuckCount++;
-                    }
-                    if (agent.stuckCount > 5) {
-                        unreachableDeliveryTiles.set(`${target.x},${target.y}`, Date.now());
-                        agent.stuckCount = 0;
-                    }
-                }
-            }
-        // Pickup intention handling.
-        } else if (agent.intention?.type === 'PICKUP') {
-            const p = agent.intention.parcel;
-            const onParcel = () => Number.isInteger(agent.x) && Number.isInteger(agent.y)
-                && agent.x === p.x && agent.y === p.y;
-
-            // Move toward the parcel if not already standing on it
-            if (!onParcel()) {
-                const status = await stepToward(p, agent);
-                if (status === 'unreachable') {
-                    unreachableParcels.set(p.id, Date.now());
-                    agent.intention = null;
-                    agent.stuckCount = 0;
-                } else if (status === 'stuck') {
-                    agent.stuckCount++;
-                    if (agent.stuckCount > 5) {
-                        // Repeated move failures — also penalize
-                        unreachableParcels.set(p.id, Date.now());
-                        agent.intention = null;
-                        agent.stuckCount = 0;
-                    }
-                } else {
-                    agent.stuckCount = 0;
-                }
-            }
-
-            // Pickup if on the parcel 
-            if (onParcel() && agent.intention?.type === 'PICKUP') {
-                const pickedUp = await safeEmit(() => agent.socket.emitPickup(), 'PICKUP');
-                if (pickedUp?.length > 0) {
-                    const stackMax = agent.beliefs.missionConstraints?.stack?.max ?? null;
-                    const newTotal = carriedCount + pickedUp.length;
-                    if (stackMax !== null && newTotal > stackMax) {
-                        // Drop parcels if exceeds stack max.
-                        const excess = newTotal - stackMax;
-                        const toDrop = pickedUp.slice(pickedUp.length - excess).map(q => q.id);
-                        await safeEmit(() => agent.socket.emitPutdown(toDrop), 'PUTDOWN');
-                    }
-                    agent.intention = null;
-                    agent.stuckCount = 0;
-                } else {
-                    unreachableParcels.set(p.id, Date.now());
-                    agent.intention = null;
-                }
-            }
-
-        } else if (agent.intention?.type === 'GOTO') {
-            const gotoTile = agent.intention.tile;
-            const gotoKey = `${gotoTile.x},${gotoTile.y}`;
-            const isStable = Number.isInteger(agent.x) && Number.isInteger(agent.y);
-            const onTile = isStable && agent.x === gotoTile.x && agent.y === gotoTile.y;
-
-            if (onTile) {
-                agent.beliefs.tileUtilities.delete(gotoKey);
-                agent.intention = null;
-                agent.stuckCount = 0;
-            } else {
-                const status = await stepToward(gotoTile, agent);
-                if (status === 'unreachable') {
-                    agent.beliefs.tileUtilities.delete(gotoKey);
-                    agent.intention = null;
-                    agent.stuckCount = 0;
-                } else if (status === 'stuck') {
-                    agent.stuckCount++;
-                    if (agent.stuckCount > 5) {
-                        agent.beliefs.tileUtilities.delete(gotoKey);
-                        agent.intention = null;
-                        agent.stuckCount = 0;
-                    }
-                } else {
-                    agent.stuckCount = 0;
-                }
-            }
-
-        } else {
-            // ---- Exploration phase, no intention present ---- 
-            const target = computeBestSpawnTile(agent, visitedSpawns);
-            if (target) {
-                const dist = Math.round(Math.sqrt((target.x - agent.x) ** 2 + (target.y - agent.y) ** 2));
-                const status = await stepToward(target, agent);
-                if (status === 'arrived') {
-                    const now = Date.now();
-                    visitedSpawns.set(`${target.x},${target.y}`, now);
-                    for (const t of agent.beliefs.map.spawnTiles) {
-                        if(Math.abs(t.x - target.x) + Math.abs(t.y - target.y) <= 2 ) {
-                            visitedSpawns.set(`${t.x},${t.y}`, now);
-                        }
-                    }
-                }
-                if (status === 'unreachable') {
-                    visitedSpawns.set(`${target.x},${target.y}`, Date.now());
-                    agent.stuckCount = 0;
-                }
-                if (status === 'stuck') {
-                    agent.stuckCount++;
-                    if (agent.stuckCount > 5) {
-                        visitedSpawns.set(`${target.x},${target.y}`, Date.now());
-                        agent.stuckCount = 0;
-                    }
-                }
-            }
-        }
+        await new Promise(resolve => setTimeout(resolve, 50));
     }
 }
 
@@ -650,7 +515,6 @@ agentLoop();
 // Logging functions.
 
 setInterval(() => {
-    agent.beliefs.log();
     const c = agent.beliefs.missionConstraints;
     if (c.hasMission()) {
         log(`[MISSION_CONSTRAINTS] stack={min:${c.stack.min},max:${c.stack.max}} | preferredTiles=${c.preferred.tiles ? JSON.stringify(c.preferred.tiles) + `(x${c.preferred.multiplier})` : 'none'} | blacklist=[${[...c.blacklist.tiles].join(',')}] | rewardCap=${c.rewardCap.cap ?? 'none'} | forbidden=[${[...c.forbidden.tiles].join(',')}]`);

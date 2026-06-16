@@ -193,8 +193,6 @@ updateMap(width, height, tiles) {
         const dir = ARROW_DIR[tile.type];
         if (dir) this.map.exitDirs.set(key, new Set([dir]));
     }
-    console.log("Queste sono le spawn tiles", this.map.spawnTiles)
-    this._logHeatMap();
 }
 
 }

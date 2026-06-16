@@ -57,6 +57,11 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
     return best;
 }
 
+
+const BELIEF_THRESHOLD = 0.1;
+
+const UNREACHABLE_PENALTY_BASE = 100;
+const UNREACHABLE_PENALTY_TAU  = 5; // seconds — penalty halves every ~3.5s, ~0 after ~20s
 /**
  * Compute utility for a parcel target.
  * U(p) = reward(p) - decay*steps_to_p - decay*steps_to_delivery(p) - decay*steps_to_p*carried_count - agent_proximity_penalty
@@ -69,11 +74,6 @@ function distToNearestDelivery(pos, deliveryTiles, walkable) {
  * @param {Map<string, { id, name, x, y }>} otherAgents  other agents in sensing range
  * @returns {number}
  */
-const BELIEF_THRESHOLD = 0.1;
-
-const UNREACHABLE_PENALTY_BASE = 100;
-const UNREACHABLE_PENALTY_TAU  = 5; // seconds — penalty halves every ~3.5s, ~0 after ~20s
-
 function computeUtility(parcel, agentPos, carriedCount, deliveryTiles, walkable, decay, otherAgents = new Map(), constraints = null, unreachableParcels = null) {
     // parcel with low belief score is probably gone — skip immediately
     if ((parcel.beliefScore ?? 1.0) < BELIEF_THRESHOLD) return -Infinity;
